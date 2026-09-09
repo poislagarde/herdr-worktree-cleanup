@@ -1,0 +1,20 @@
+id = "poislagarde.worktree-cleanup"
+name = "Worktree Cleanup"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Remove clean, pushed GitHub PR worktrees after their Herdr space closes."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "check"
+title = "Check worktree cleanup eligibility"
+contexts = ["workspace"]
+command = ["python3", "plugin.py", "check"]
+
+[[events]]
+on = "workspace.closed"
+command = ["python3", "plugin.py", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "plugin.py", "event"]
