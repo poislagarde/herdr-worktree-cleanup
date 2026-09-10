@@ -32,9 +32,19 @@ Each event can remove only the linked worktree recorded by herdr for that space.
 - The GitHub repository identified by `origin` has at least one pull request for the branch, and none of its pull requests are open.
 - Local `HEAD` matches a closed or merged PR's recorded head SHA, or is an ancestor of the freshly advertised `origin` branch tip whose Git object is available locally.
 
-The plugin locks cleanup per repository and rechecks eligibility and worktree identity before calling `git worktree remove` without `--force`. It preserves the branch. Missing information, failed API calls, network errors, or failed checks keep the worktree.
+The plugin locks cleanup per repository and rechecks eligibility and worktree identity before calling `git worktree remove` without `--force`. It preserves the branch. Missing information or failed checks before removal keep the worktree.
 
-Git-ignored files do not block cleanup and are removed with the checkout.
+Read-only Git and GitHub commands have a 30-second timeout. Once removal starts, let it finish without a timeout. Other cleanup requests for the same repository wait and recheck eligibility after acquiring the lock. Success requires both the checkout directory and its Git registration to be gone. A removal failure may leave a partial checkout and produces a warning notification and a `failed` log outcome.
+
+The entire eligible checkout is removed, including Git-ignored virtual environments, dependencies, caches, and build outputs. Ignored files do not block cleanup. Use the repository's `.gitignore`, its `.git/info/exclude`, or your global Git excludes file to configure ignore patterns; for example:
+
+```gitignore
+.venv/
+node_modules/
+__pycache__/
+```
+
+Tracked changes, non-ignored untracked files, and nested Git repositories still block cleanup. Ignore rules only affect eligibility; cleanup removes the whole checkout after all checks pass.
 
 There is no broad sweep, startup cleanup, or scheduled retry. A kept worktree remains available for manual inspection and cleanup.
 
@@ -68,7 +78,7 @@ This action never removes a worktree. Read the decision and its JSON reason in t
 herdr plugin log list --plugin poislagarde.worktree-cleanup
 ```
 
-Successful removal and eligible worktrees in `notify` mode produce a toast. To stop automatic checks:
+Successful removal, removal failures, and eligible worktrees in `notify` mode produce a toast. The log's `notification_delivered` field records whether Herdr accepted the notification; a delivery failure does not change the cleanup outcome. To stop automatic checks:
 
 ```sh
 herdr plugin disable poislagarde.worktree-cleanup

@@ -13,7 +13,7 @@ class CheckError(Exception):
     """An eligibility check could not safely complete."""
 
 
-def _run(argv, cwd):
+def _run(argv, cwd, *, timeout=30):
     env = os.environ.copy()
     # Git honors these even with an explicit cwd. Scope every invocation to the
     # supplied checkout, including when launched inside another Git command.
@@ -24,20 +24,24 @@ def _run(argv, cwd):
                 "GIT_NO_REPLACE_OBJECTS": "1", "GH_HOST": "github.com",
                 "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oConnectionAttempts=1 -oConnectTimeout=15",
                 "GCM_INTERACTIVE": "never", "GH_PROMPT_DISABLED": "1"})
+    command = " ".join(argv[:3] if argv[:2] == ["git", "worktree"] else argv[:2])
     try:
         result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                encoding="utf-8", errors="strict", timeout=30,
+                                encoding="utf-8", errors="strict", timeout=timeout,
                                 check=False)
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
-        raise CheckError("{} check unavailable: {}".format(argv[0], type(exc).__name__)) from exc
+        raise CheckError("{} unavailable: {}".format(command, type(exc).__name__)) from exc
     if result.returncode:
-        raise CheckError("{} {} failed (exit {})".format(argv[0], argv[1], result.returncode))
+        message = "{} failed (exit {})".format(command, result.returncode)
+        if result.stderr.strip():
+            message += ": " + result.stderr.strip()[:500]
+        raise CheckError(message)
     return result.stdout
 
 
-def _git(args, cwd):
-    return _run(["git"] + args, cwd)
+def _git(args, cwd, *, timeout=30):
+    return _run(["git"] + args, cwd, timeout=timeout)
 
 
 def _real(path):
@@ -263,7 +267,20 @@ def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
         # wait, immediately before Git's own non-forced cleanliness guard.
         if not _final_unchanged(candidate):
             return dict(result, reason="worktree identity, branch, HEAD, or status changed during usage check")
-        _git(["worktree", "remove", "--", candidate["path"]], candidate["repo_root"])
+        result = dict(current, outcome="failed")
+        # Removal can take arbitrarily long for ignored dependency directories.
+        # Killing it on a check deadline can leave a partially deleted checkout.
+        _git(["worktree", "remove", "--", candidate["path"]], candidate["repo_root"], timeout=None)
+        if os.path.lexists(candidate["path"]):
+            raise CheckError("git worktree remove left the checkout on disk")
+        if any(os.path.realpath(record.get("worktree", "")) == candidate["path"]
+               for record in _worktrees(candidate["common_dir"])):
+            raise CheckError("git worktree remove left the worktree registration")
+        if os.path.lexists(candidate["git_dir"]):
+            raise CheckError("git worktree remove left the worktree Git metadata")
         return dict(current, outcome="removed", reason="removed clean worktree; local branch retained")
     except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
-        return dict(result, reason=str(exc) or "removal check failed")
+        reason = str(exc) or "removal check failed"
+        if result["outcome"] == "failed":
+            reason += "; removal may be incomplete"
+        return dict(result, reason=reason)

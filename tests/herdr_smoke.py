@@ -260,9 +260,17 @@ def smoke(root, herdr, plugin_dir, servers):
     first.run("plugin", "link", str(plugin_dir), "--enabled")
 
     path = fixtures.worktree("last-tab")
+    (fixtures.repo / ".git" / "info" / "exclude").write_text(".venv/\nnode_modules/\n")
+    for name in ("services/worker/.venv/lib/package.py", "web/node_modules/package/index.js"):
+        generated = path / name
+        generated.parent.mkdir(parents=True)
+        generated.write_text("generated dependency\n")
     first.close_last_tab(first.open_worktree(fixtures.repo, path))
     fixtures.assert_removed(path, "last-tab")
-    print("PASS: closing the last tab removes an eligible worktree and retains its branch")
+    outcomes = [json.loads(log["stdout"]) for log in first.logs() if log.get("stdout")]
+    removed = next(result for result in outcomes if result.get("outcome") == "removed")
+    assert removed["notification_delivered"] is True
+    print("PASS: closing the last tab removes checkout and ignored dependencies, retains branch, and sends notification")
 
     path = fixtures.worktree("natural-exit", state="CLOSED")
     workspace = first.open_worktree(fixtures.repo, path)

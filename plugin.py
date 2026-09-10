@@ -114,9 +114,10 @@ class Herdr:
     def notify(self, title, body):
         try:
             self.call("notification", "show", title, "--body", body, "--sound", "none")
+            return True
         except Keep:
             # A notification failure cannot undo a completed removal.
-            pass
+            return False
 
 
 def inside(value, checkout):
@@ -183,15 +184,8 @@ def repository_lock(repo):
     lock = directory / (hashlib.sha256(os.fsencode(repo)).hexdigest() + ".lock")
     descriptor = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise Keep("another cleanup is still running for this repository")
-                time.sleep(0.1)
+        # Queue cleanup until the prior removal finishes, then recheck eligibility.
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
         os.close(descriptor)
@@ -214,8 +208,9 @@ def run(action):
     with repository_lock(absolute_path(candidate.get("common_dir"))):
         if mode == "notify":
             herdr.unused(checkout, workspace_id)
-            herdr.notify("Worktree ready for cleanup", checkout)
-            return dict(candidate, outcome="eligible", reason="notification-only mode")
+            delivered = herdr.notify("Worktree ready for cleanup", checkout)
+            return dict(candidate, outcome="eligible", reason="notification-only mode",
+                        notification_delivered=delivered)
         def still_unused():
             if configured_mode() != "auto":
                 raise Keep("automatic removal was disabled during the check")
@@ -223,7 +218,12 @@ def run(action):
 
         result = remove_candidate(candidate, still_unused)
         if result.get("outcome") == "removed":
-            herdr.notify("Worktree removed", checkout)
+            result["notification_delivered"] = herdr.notify("Worktree removed", checkout)
+        elif result.get("outcome") == "failed":
+            result["notification_delivered"] = herdr.notify(
+                "Worktree cleanup failed",
+                checkout + "\n" + result["reason"] + "\nThe checkout may be partially removed; inspect the plugin log.",
+            )
         return result
 
 
@@ -236,7 +236,7 @@ def main():
     except (Keep, OSError, ValueError) as error:
         result = {"outcome": "kept", "reason": str(error)}
     print(json.dumps(result, sort_keys=True))
-    return 0
+    return 1 if result.get("outcome") == "failed" else 0
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -386,34 +387,67 @@ class PluginTests(unittest.TestCase):
         self.remove_candidate.assert_called_once()
 
     def test_repository_lock_serializes_duplicate_hooks_and_releases(self):
+        waiting, acquired = threading.Event(), threading.Event()
+
+        def next_cleanup():
+            waiting.set()
+            with plugin.repository_lock(self.repo):
+                acquired.set()
+
         with plugin.repository_lock(self.repo):
-            with mock.patch.object(plugin.time, "monotonic", side_effect=[0, 31]):
-                with self.assertRaisesRegex(plugin.Keep, "another cleanup"):
-                    with plugin.repository_lock(self.repo):
-                        self.fail("duplicate cleanup acquired repository lock")
+            worker = threading.Thread(target=next_cleanup, daemon=True)
+            worker.start()
+            self.addCleanup(worker.join, 2)
+            self.assertTrue(waiting.wait(2))
+            self.assertFalse(acquired.wait(0.05))
             with plugin.repository_lock(str(self.root / "unrelated-repository")):
                 pass
-        with plugin.repository_lock(self.repo):
-            pass
+        self.assertTrue(acquired.wait(2))
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
 
     def test_linked_repository_roots_share_the_common_git_directory_lock(self):
-        with plugin.repository_lock(self.common_dir):
-            for recorded_root in (self.repo, str(self.root / "another-checkout")):
-                with self.subTest(recorded_root=recorded_root):
-                    self.event["data"]["workspace"]["worktree"]["repo_root"] = recorded_root
-                    self.set_event()
-                    self.evaluate.return_value = dict(self.candidate, repo_root=recorded_root)
-                    with mock.patch.object(plugin.Herdr, "wait_closed"):
-                        with mock.patch.object(plugin.time, "monotonic", side_effect=[0, 31]):
-                            with self.assertRaisesRegex(plugin.Keep, "another cleanup"):
-                                plugin.run("event")
-                    self.evaluate.assert_called_with(self.checkout, recorded_root)
-                    self.remove_candidate.assert_not_called()
+        for recorded_root in (self.repo, str(self.root / "another-checkout")):
+            with self.subTest(recorded_root=recorded_root):
+                self.event["data"]["workspace"]["worktree"]["repo_root"] = recorded_root
+                self.set_event()
+                self.evaluate.return_value = dict(self.candidate, repo_root=recorded_root)
+                with mock.patch.object(plugin, "repository_lock", wraps=plugin.repository_lock) as lock:
+                    self.assertEqual(plugin.run("event")["outcome"], "removed")
+                lock.assert_called_once_with(self.common_dir)
+                self.evaluate.assert_called_with(self.checkout, recorded_root)
 
     def test_notification_failure_does_not_hide_successful_removal(self):
         command = ("notification", "show", "Worktree removed", "--body", self.checkout, "--sound", "none")
         self.failures[(self.socket, command)] = (1, "")
-        self.assertEqual(plugin.run("event")["outcome"], "removed")
+        result = plugin.run("event")
+        self.assertEqual(result["outcome"], "removed")
+        self.assertFalse(result["notification_delivered"])
+
+    def test_removal_failure_warns_about_partial_checkout(self):
+        self.remove_candidate.side_effect = None
+        self.remove_candidate.return_value = dict(self.candidate, outcome="failed",
+                                                  reason="git worktree remove failed (exit 1)")
+        result = plugin.run("event")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(result["notification_delivered"])
+        notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0][2], "Worktree cleanup failed")
+        self.assertIn(self.checkout, notices[0][4])
+        self.assertIn(result["reason"], notices[0][4])
+        self.assertIn("partially removed", notices[0][4])
+
+    def test_failed_removal_is_logged_with_nonzero_exit_status(self):
+        self.remove_candidate.side_effect = None
+        self.remove_candidate.return_value = dict(self.candidate, outcome="failed", reason="removal failed")
+        output = io.StringIO()
+        with mock.patch.object(plugin.sys, "argv", ["plugin.py", "event"]):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(plugin.main(), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(result["notification_delivered"])
 
     def test_main_logs_invalid_configuration_as_json_kept(self):
         self.configure({"mode": []})

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,7 @@ class CleanupTests(unittest.TestCase):
         self.calls = []
         original_run = cleanup._run
 
-        def simulated_network(argv, cwd):
+        def simulated_network(argv, cwd, **kwargs):
             self.calls.append(list(argv))
             if argv[0] == "gh":
                 if self.network_failure == "gh":
@@ -51,7 +52,7 @@ class CleanupTests(unittest.TestCase):
                 if self.network_failure == "remote":
                     raise cleanup.CheckError("remote unavailable")
                 return "" if self.remote_tip is None else self.remote_tip + "\trefs/heads/feature\n"
-            return original_run(argv, cwd)
+            return original_run(argv, cwd, **kwargs)
 
         self.patcher = patch.object(cleanup, "_run", side_effect=simulated_network)
         self.patcher.start()
@@ -247,6 +248,114 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
         self.assertFalse(any("--force" in call or "prune" in call or "fetch" in call for call in self.calls))
+
+    def test_removal_includes_ignored_nested_virtualenvs_and_node_modules(self):
+        (self.root / ".git" / "info" / "exclude").write_text("**/.venv/\n**/node_modules/\n")
+        for relative in ("services/api/.venv/lib/python/site-packages/pkg/data",
+                         "services/worker/.venv/bin/python",
+                         "web/node_modules/pkg/index.js"):
+            path = self.target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("generated dependency\n")
+        candidate = self.evaluate()
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "removed", result)
+        self.assertFalse(self.target.exists())
+        self.assertFalse(Path(candidate["git_dir"]).exists())
+        self.assertNotIn(str(self.target), self.git("worktree", "list", "--porcelain"))
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+
+    def test_removal_verification_can_outlive_recorded_repository_root(self):
+        candidate = cleanup.evaluate(str(self.target), str(self.target))
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "removed", result)
+        self.assertFalse(self.target.exists())
+
+    def test_slow_removal_has_no_check_deadline(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+        removal_calls = []
+
+        def run_with_slow_removal(argv, **kwargs):
+            if argv[:3] == ["git", "worktree", "remove"]:
+                removal_calls.append(argv)
+                self.assertIsNone(kwargs["timeout"])
+                # A short stand-in for a large ignored dependency directory.
+                argv = [sys.executable, "-c",
+                        "import os, sys, time; time.sleep(0.1); os.execvp(sys.argv[1], sys.argv[1:])",
+                        *argv]
+            else:
+                self.assertEqual(kwargs["timeout"], 30)
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=run_with_slow_removal):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "removed", result)
+        self.assertEqual(len(removal_calls), 1)
+        self.assertFalse(self.target.exists())
+
+    def test_partial_removal_failure_is_reported_as_failed(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def fail_during_removal(argv, **kwargs):
+            if argv[:3] == ["git", "worktree", "remove"]:
+                (self.target / ".git").unlink()
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cannot unlink remaining file")
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=fail_during_removal):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertIn("git worktree remove failed (exit 1)", result["reason"])
+        self.assertIn("cannot unlink remaining file", result["reason"])
+        self.assertIn("removal may be incomplete", result["reason"])
+        self.assertTrue(self.target.exists())
+        self.assertFalse((self.target / ".git").exists())
+
+    def test_successful_command_must_remove_checkout(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def leave_checkout(argv, **kwargs):
+            if argv[:3] == ["git", "worktree", "remove"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=leave_checkout):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertIn("left the checkout", result["reason"])
+
+    def test_successful_command_must_remove_exact_registration(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def leave_registration(argv, **kwargs):
+            if argv[:3] == ["git", "worktree", "remove"]:
+                shutil.rmtree(self.target)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=leave_registration):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertIn("left the worktree registration", result["reason"])
+
+    def test_successful_command_must_remove_git_metadata(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def leave_metadata(argv, **kwargs):
+            result = original_run(argv, **kwargs)
+            if argv[:3] == ["git", "worktree", "remove"]:
+                Path(candidate["git_dir"]).mkdir(parents=True)
+            return result
+
+        with patch.object(cleanup.subprocess, "run", side_effect=leave_metadata):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertIn("left the worktree Git metadata", result["reason"])
 
     def test_moved_head_is_kept_even_if_new_tip_is_also_recoverable(self):
         candidate = self.evaluate()
