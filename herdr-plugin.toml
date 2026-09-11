@@ -1,15 +1,48 @@
 id = "poislagarde.worktree-cleanup"
 name = "Worktree Cleanup"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.2"
-description = "Remove clean, pushed GitHub PR worktrees and their local branches after their Herdr space closes."
+description = "Clean disposable files and unused worktree checkouts while preserving local work."
 platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "plugin.py", "observe"]
 
 [[actions]]
 id = "check"
 title = "Check worktree cleanup eligibility"
 contexts = ["workspace"]
 command = ["python3", "plugin.py", "check"]
+
+[[actions]]
+id = "check-unused"
+title = "Preview cleanup of known unused worktrees"
+contexts = ["global", "workspace"]
+command = ["python3", "plugin.py", "check-unused"]
+
+[[actions]]
+id = "clean-unused"
+title = "Clean known unused worktrees"
+contexts = ["global", "workspace"]
+command = ["python3", "plugin.py", "clean-unused"]
+
+[[actions]]
+id = "observe"
+title = "Record open worktrees for future cleanup"
+contexts = ["global", "workspace"]
+command = ["python3", "plugin.py", "observe"]
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "plugin.py", "observe"]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "plugin.py", "observe"]
+
+[[events]]
+on = "worktree.opened"
+command = ["python3", "plugin.py", "observe"]
 
 [[events]]
 on = "workspace.closed"
