@@ -4,7 +4,7 @@ Reclaim disposable files when a herdr space closes, and remove its checkout when
 
 ## Install
 
-Requires [herdr](https://herdr.dev/) 0.8.2 or newer, Python 3.9 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
+Requires [herdr](https://herdr.dev/) 0.9.0 or newer, Python 3.9 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
 
 Run from a local herdr pane:
 
@@ -33,7 +33,7 @@ Ignored files require explicit disposal permission through `disposable.gitignore
 
 Tracked modifications and non-ignored untracked files are always protected, including links. Partial cleanup removes approved ignored files while preserving everything else. A protected file inside an approved directory prevents removal of the whole checkout.
 
-Primary checkouts, protected branches, locked worktrees, active Git operations, nested repositories, and indexes with `assume-unchanged` or `skip-worktree` entries are protected. Cleanup requires herdr's linked-worktree provenance and Git's exact worktree registration. The plugin verifies that no running local herdr space or pane uses the checkout, including pane working directories within it. Unavailable or ambiguous live state blocks deletion.
+Primary checkouts, protected branches, locked worktrees, active Git operations, nested repositories, and indexes with `assume-unchanged` or `skip-worktree` entries are protected. Cleanup requires herdr's linked-worktree provenance or an explicit registration attributed to a live herdr pane, plus Git's exact worktree registration. The plugin verifies that no running local herdr space or pane uses the checkout, including registered owner spaces, their terminals after pane moves, and pane working directories within it. Unavailable or ambiguous live state blocks deletion.
 
 The plugin serializes cleanup per repository and rechecks worktree identity, local files, disposal rules, and usage before deletion. Branch cleanup separately verifies closed/merged PR eligibility, remote recoverability, an unchanged branch tip, and no other worktree using the branch. Branch deletion is skipped while any worktree in the repository has rebase or bisect state.
 
@@ -64,7 +64,7 @@ An absent pattern file allows no ordinary ignored files; the safe-link defaults 
 
 Cleanup runs on `workspace.closed` and on `pane.exited` after verifying that the space has disappeared. Closing a non-last pane does not clean the worktree. There are no periodic retries or startup cleanup.
 
-Startup and worktree creation/opening record authoritative herdr worktree metadata in the plugin state directory. Kept and partially cleaned worktrees stay registered for later sweeps. Observation records checkout identity so a different checkout reused at the same path is not silently treated as the original.
+Startup and worktree creation/opening record authoritative herdr worktree metadata in the plugin state directory. Explicit registrations associate additional worktrees with their owning spaces. Closing a space considers all its registered worktrees, across repositories, and its primary linked checkout. Each candidate is checked independently. Kept and partially cleaned worktrees stay registered for later sweeps. Observation records checkout identity so a different checkout reused at the same path is not silently treated as the original.
 
 Preview all known unused worktrees:
 
@@ -78,7 +78,7 @@ Perform the same sweep with cleanup enabled:
 herdr plugin action invoke poislagarde.worktree-cleanup.clean-unused
 ```
 
-Sweeps act only on recorded herdr worktrees and recheck every running local herdr session and pane. They do not infer ownership from folder or branch names. For an older worktree that was never observed, open it through `herdr worktree open` to record provenance. To record currently open worktrees without cleaning anything:
+Sweeps act only on recorded worktrees and recheck every running local herdr session and pane. They do not infer ownership from folder or branch names. For an older worktree that was never observed, open it through `herdr worktree open` to record provenance. To record currently open worktrees without cleaning anything:
 
 ```sh
 herdr plugin action invoke poislagarde.worktree-cleanup.observe
@@ -89,6 +89,54 @@ The `check-unused` action does not modify checkouts, branches, or the provenance
 ```sh
 herdr plugin action invoke poislagarde.worktree-cleanup.check
 ```
+
+## Register worktrees created by agents
+
+A space can own several worktrees, including worktrees from different repositories.
+After creating or starting to use one, run this synchronously from the creating
+herdr pane (replace `<plugin-root>` with this installed plugin's directory):
+
+```sh
+python3 <plugin-root>/plugin.py register --checkout /absolute/worktree/path --defer-on-unavailable
+```
+
+Registration records the exact linked checkout, primary repository and filesystem
+identity. Dirty, detached and locked worktrees may be registered; the existing
+cleanup rules still decide whether any files can be removed. Repeated registrations
+are idempotent. Multiple spaces may register the same checkout, and every owner
+must be closed before cleanup can proceed, even when an agent's pane directory
+is elsewhere and its commands use `git -C`.
+
+Attribution requires inherited `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. The plugin
+resolves that pane's current workspace and terminal through herdr. It never
+substitutes the focused space or trusts an inherited workspace ID after a pane
+move. Register at creation/use time: space-close snapshots do not contain a
+history of worktrees used by commands.
+
+If a sandbox prevents the live pane lookup, `--defer-on-unavailable` stores a
+pending request with the original pane/socket and exact checkout identity. A
+host-side agent hook can validate queued requests after a tool finishes:
+
+```sh
+python3 <plugin-root>/plugin.py drain
+```
+
+`drain` needs no current pane environment and never cleans files. It processes
+at most four due requests per invocation. Unavailable requests retry after
+30 seconds with exponential backoff, capped at one hour. A request whose checkout
+is positively missing or replaced is rejected; other uncertainty keeps it pending.
+A matching pending request blocks cleanup until ownership can be verified.
+Neither command starts a watcher or performs a cleanup sweep.
+
+State lives in `$XDG_STATE_HOME/herdr/plugins/poislagarde.worktree-cleanup`
+(default `~/.local/state/herdr/plugins/poislagarde.worktree-cleanup`), in
+`worktrees.json`. Config lives under `$XDG_CONFIG_HOME/herdr/plugins/config/poislagarde.worktree-cleanup`
+(default `~/.config/herdr/plugins/config/poislagarde.worktree-cleanup`). Explicit
+`HERDR_PLUGIN_STATE_DIR` / `HERDR_PLUGIN_CONFIG_DIR` overrides take precedence.
+Adapters invoked from another plugin must pass this plugin's directories.
+The v2 registry retains existing v1 observations; read-only previews do not rewrite
+old registry files. Registration and cleanup share per-repository locks so a
+newly accepted owner cannot race removal.
 
 ## Configuration and reporting
 
@@ -122,7 +170,7 @@ Re-enable with `herdr plugin enable poislagarde.worktree-cleanup`.
 
 The plugin checks running local herdr sessions and panes. It cannot detect use by remote hosts or external applications. Reinstall dependencies after reopening a worktree whose disposable files were cleaned.
 
-Missing provenance, including after some pane moves, keeps the worktree. In herdr 0.8.2, closing a group emits a close event only for its primary space; use the explicit sweep for recorded child worktrees that remain.
+Requires herdr 0.9.0 or newer. Group closure emits a close event for each member. A pane move transfers registered ownership by terminal identity. Missing provenance and missing explicit registration keep an otherwise undiscovered worktree; ordinary pane directories are usage protection, not automatic registration.
 
 Read-only Git and GitHub commands have a 30-second timeout. Once worktree removal starts, let it finish without a timeout. Concurrent cleanup requests wait for the repository lock and then recheck eligibility.
 

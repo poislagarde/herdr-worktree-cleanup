@@ -260,6 +260,96 @@ os.execv(os.environ["HERDR_CLEANUP_TEST_GIT"], [os.environ["HERDR_CLEANUP_TEST_G
     return env
 
 
+def register_worktree(server, plugin_dir, workspace, checkout, **overrides):
+    panes = server.run("pane", "list")["panes"]
+    pane = next(pane for pane in panes if pane["workspace_id"] == workspace["workspace_id"])
+    env = dict(server.env, HERDR_BIN_PATH=server.herdr, HERDR_PANE_ID=pane["pane_id"],
+               # Deliberately stale: registration must resolve the live pane.
+               HERDR_WORKSPACE_ID="stale-workspace-id")
+    env.update(overrides)
+    return json.loads(command(
+        [sys.executable, plugin_dir / "plugin.py", "register", "--checkout", checkout,
+         "--defer-on-unavailable"], server.root, env))
+
+
+def registration_smoke(root, plugin_dir, first, second, fixtures):
+    owner = first.create(fixtures.repo, "Several registered worktrees")["workspace"]
+    a = fixtures.worktree("registered-a", state="OPEN")
+    b = fixtures.worktree("registered-b", state="OPEN")
+    other_root = root / "another-repository"
+    other_root.mkdir()
+    other = Fixtures(other_root, fixtures.env, fixtures.git)
+    c = other.worktree("registered-c", state="OPEN")
+    for checkout in (a, b, c):
+        result = register_worktree(first, plugin_dir, owner, checkout)
+        assert result["outcome"] == "registered", result
+        assert result["workspace_id"] == owner["workspace_id"], result
+    # The dirty checkout is retained, but the clean sibling candidates still run.
+    (b / "notes.txt").write_text("Keep my notes\n")
+    first.close_last_tab(owner)
+    assert not a.exists() and not c.exists(), "A space close missed a registered worktree"
+    assert (b / "notes.txt").read_text() == "Keep my notes\n"
+    assert fixtures.run("rev-parse", "--verify", "refs/heads/registered-a")
+    assert other.run("rev-parse", "--verify", "refs/heads/registered-c")
+    print("PASS: one ordinary space cleans registered worktrees across repositories and preserves a dirty sibling")
+
+    shared = fixtures.worktree("registered-shared", state="OPEN")
+    owner_a = first.create(fixtures.repo, "First registered owner")["workspace"]
+    owner_b = second.create(fixtures.repo, "Second registered owner")["workspace"]
+    for server, workspace in ((first, owner_a), (second, owner_b)):
+        result = register_worktree(server, plugin_dir, workspace, shared)
+        assert result["outcome"] == "registered", result
+    first.close_last_tab(owner_a)
+    assert shared.is_dir(), "Another registered owner was ignored because its cwd was elsewhere"
+    preview = first.action("check-unused")
+    assert any(result["path"] == str(shared) and result["outcome"] == "kept"
+               for result in preview["results"]), preview
+    second.close_last_tab(owner_b)
+    assert not shared.exists(), "Last registered owner did not trigger cleanup"
+    print("PASS: registered ownership protects git -C use across local sessions until the last space closes")
+
+    pending = fixtures.worktree("registered-pending", state="OPEN")
+    earlier_owner = first.create(fixtures.repo, "Earlier registered owner")["workspace"]
+    result = register_worktree(first, plugin_dir, earlier_owner, pending)
+    assert result["outcome"] == "registered", result
+    owner = first.create(fixtures.repo, "Deferred worktree registration")["workspace"]
+    unavailable = root / "unavailable-herdr"
+    unavailable.write_text("#!/bin/sh\nexit 1\n")
+    unavailable.chmod(0o755)
+    result = register_worktree(first, plugin_dir, owner, pending,
+                               HERDR_BIN_PATH=str(unavailable))
+    assert result["outcome"] == "pending", result
+    first.close_last_tab(earlier_owner)
+    assert pending.is_dir(), "Cleanup ignored another space's pending registration"
+    drained = json.loads(command([sys.executable, plugin_dir / "plugin.py", "drain"], root,
+                                dict(first.env, HERDR_BIN_PATH=first.herdr)))
+    assert drained["registered"] >= 1, drained
+    assert pending.is_dir(), "Draining registrations performed cleanup"
+    first.close_last_tab(owner)
+    assert not pending.exists(), "Deferred registration did not reach space cleanup"
+    print("PASS: pending registration protects a checkout, drains without cleanup and is checked on last space close")
+
+    moved = fixtures.worktree("registered-moved", state="OPEN")
+    owner = first.create(fixtures.repo, "Moving a registered owner")["workspace"]
+    result = register_worktree(first, plugin_dir, owner, moved)
+    assert result["outcome"] == "registered", result
+    panes = first.run("pane", "list")["panes"]
+    pane = next(pane for pane in panes if pane["workspace_id"] == owner["workspace_id"])
+    previous = {log["log_id"] for log in first.logs()}
+    result = first.run("pane", "move", pane["pane_id"], "--new-workspace", "--no-focus")
+    first.settled(previous, "pane.moved")
+    assert moved.is_dir(), "Moving the registered owner caused premature cleanup"
+    moved_workspace_id = result["move_result"]["pane"]["workspace_id"]
+    moved_workspace = next(workspace for workspace in first.run("workspace", "list")["workspaces"]
+                           if workspace["workspace_id"] == moved_workspace_id)
+    result = register_worktree(first, plugin_dir, moved_workspace, moved,
+                               HERDR_PANE_ID=pane["pane_id"])
+    assert result["outcome"] == "registered" and result["workspace_id"] == moved_workspace_id, result
+    first.close_last_tab(moved_workspace)
+    assert not moved.exists(), "Moved owner was not associated with its new space"
+    print("PASS: moving a registered pane transfers ownership and cleanup waits for its destination space to close")
+
+
 def smoke(root, herdr, plugin_dir, servers):
     git = shutil.which("git")
     if not git:
@@ -385,6 +475,7 @@ def smoke(root, herdr, plugin_dir, servers):
     first.close_last_tab(workspace)
     assert path.is_dir(), "Removed checkout used by another Herdr session"
     print("PASS: another local Herdr session protects the checkout")
+    registration_smoke(root, plugin_dir, first, second, fixtures)
 
 
 def main():
