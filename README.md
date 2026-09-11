@@ -1,6 +1,6 @@
 # herdr worktree cleanup
 
-Automatically remove eligible Git worktrees when their last herdr tab closes. The plugin checks that the worktree is clean, its GitHub pull requests are closed or merged, and its commits are pushed. It keeps the local branch.
+Automatically remove eligible Git worktrees and their local branches when their last herdr tab closes. The plugin checks that the worktree is clean, its GitHub pull requests are closed or merged, and its commits are pushed. Remote branches are unchanged.
 
 Cleanup is enabled by default. Set `mode` to `notify` to report eligible worktrees without removing them.
 
@@ -32,9 +32,13 @@ Each event can remove only the linked worktree recorded by herdr for that space.
 - The GitHub repository identified by `origin` has at least one pull request for the branch, and none of its pull requests are open.
 - Local `HEAD` matches a closed or merged PR's recorded head SHA, or is an ancestor of the freshly advertised `origin` branch tip whose Git object is available locally.
 
-The plugin locks cleanup per repository and rechecks eligibility and worktree identity before calling `git worktree remove` without `--force`. It preserves the branch. Missing information or failed checks before removal keep the worktree.
+Primary checkouts are protected regardless of their directory or current branch. Cleanup requires both herdr's linked-worktree provenance and Git's exact worktree registration with separate metadata under the repository's common Git directory. Switching a primary checkout to a PR branch does not make it eligible.
 
-Read-only Git and GitHub commands have a 30-second timeout. Once removal starts, let it finish without a timeout. Other cleanup requests for the same repository wait and recheck eligibility after acquiring the lock. Success requires both the checkout directory and its Git registration to be gone. A removal failure may leave a partial checkout and produces a warning notification and a `failed` log outcome.
+The plugin locks cleanup per repository and rechecks eligibility and worktree identity before calling `git worktree remove` without `--force`. After verifying complete worktree removal, it rechecks branch eligibility and deletes the local branch only if its tip is unchanged and no other worktree uses it. Closed, unmerged PRs and squash merges are eligible when their commits are recoverable under the same checks. Missing information or failed checks before removal keep the worktree and branch.
+
+Branch deletion is skipped while any worktree in the repository has rebase or bisect state. A skipped branch deletion reports a warning; the completed worktree removal remains in effect.
+
+Read-only Git and GitHub commands have a 30-second timeout. Once worktree removal starts, let it finish without a timeout. Other cleanup requests for the same repository wait and recheck eligibility after acquiring the lock. Success requires the checkout directory, Git registration, and local branch to be gone. A removal failure produces a warning notification and a `failed` log outcome; `worktree_removed` and `branch_removed` report which steps completed.
 
 The entire eligible checkout is removed, including Git-ignored virtual environments, dependencies, caches, and build outputs. Ignored files do not block cleanup. Use the repository's `.gitignore`, its `.git/info/exclude`, or your global Git excludes file to configure ignore patterns; for example:
 

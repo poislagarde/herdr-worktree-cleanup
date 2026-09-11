@@ -117,7 +117,7 @@ class PluginTests(unittest.TestCase):
     @staticmethod
     def remove(candidate, unused):
         unused()
-        return dict(candidate, outcome="removed")
+        return dict(candidate, outcome="removed", worktree_removed=True, branch_removed=True)
 
     def assert_kept_before_git(self):
         with self.assertRaises(plugin.Keep):
@@ -222,7 +222,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "removed")
         self.remove_candidate.assert_called_once()
         self.assertEqual(self.calls.count((self.socket, ("session", "list", "--json"))), 2)
-        self.assertTrue(any(command[:3] == ("notification", "show", "Worktree removed")
+        self.assertTrue(any(command[:3] == ("notification", "show", "Worktree and branch removed")
                             for _, command in self.calls))
 
     def test_notify_reports_candidate_without_removing(self):
@@ -418,7 +418,8 @@ class PluginTests(unittest.TestCase):
                 self.evaluate.assert_called_with(self.checkout, recorded_root)
 
     def test_notification_failure_does_not_hide_successful_removal(self):
-        command = ("notification", "show", "Worktree removed", "--body", self.checkout, "--sound", "none")
+        command = ("notification", "show", "Worktree and branch removed", "--body",
+                   self.checkout + "\nLocal branch: feature", "--sound", "none")
         self.failures[(self.socket, command)] = (1, "")
         result = plugin.run("event")
         self.assertEqual(result["outcome"], "removed")
@@ -448,6 +449,22 @@ class PluginTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(result["outcome"], "failed")
         self.assertTrue(result["notification_delivered"])
+
+    def test_branch_failure_notification_reports_completed_worktree_deletion(self):
+        self.remove_candidate.side_effect = None
+        self.remove_candidate.return_value = dict(
+            self.candidate, outcome="failed", worktree_removed=True, branch_removed=False,
+            reason="local branch tip changed",
+        )
+        result = plugin.run("event")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(result["notification_delivered"])
+        notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0][2], "Branch cleanup failed")
+        self.assertIn("Worktree removed; local branch cleanup incomplete: feature", notices[0][4])
+        self.assertIn("local branch tip changed", notices[0][4])
+        self.assertNotIn("partially removed", notices[0][4])
 
     def test_main_logs_invalid_configuration_as_json_kept(self):
         self.configure({"mode": []})

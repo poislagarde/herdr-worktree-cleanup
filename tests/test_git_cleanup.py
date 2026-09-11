@@ -71,6 +71,32 @@ class CleanupTests(unittest.TestCase):
     def evaluate(self):
         return cleanup.evaluate(str(self.target), str(self.root))
 
+    def remove_then(self, after_worktree_removal):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def run_then(argv, **kwargs):
+            result = original_run(argv, **kwargs)
+            if argv[:3] == ["git", "worktree", "remove"] and not result.returncode:
+                after_worktree_removal()
+            return result
+
+        with patch.object(cleanup.subprocess, "run", side_effect=run_then):
+            return cleanup.remove_candidate(candidate, lambda: True)
+
+    def assert_branch_removed(self, result):
+        self.assertEqual(result["outcome"], "removed", result)
+        self.assertTrue(result["worktree_removed"])
+        self.assertTrue(result["branch_removed"])
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/feature"), "")
+        self.assertFalse((self.root / ".git" / "logs" / "refs" / "heads" / "feature").exists())
+
+    def assert_only_worktree_removed(self, result):
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertTrue(result["worktree_removed"])
+        self.assertFalse(result["branch_removed"])
+        self.assertFalse(self.target.exists())
+
     def assert_kept(self, fragment=None):
         result = self.evaluate()
         self.assertFalse(result["eligible"], result)
@@ -80,12 +106,16 @@ class CleanupTests(unittest.TestCase):
         return result
 
     def test_merged_squashed_deleted_remote_head_is_recoverable(self):
-        self.assertTrue(self.evaluate()["eligible"])
+        self.git("merge", "--squash", "feature")
+        self.git("commit", "-m", "squash feature")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_branch_removed(result)
         self.assertFalse(any(call[:2] == ["git", "ls-remote"] for call in self.calls))
 
     def test_closed_unmerged_pr_head_is_recoverable(self):
         self.prs[0]["state"] = "CLOSED"
-        self.assertTrue(self.evaluate()["eligible"])
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_branch_removed(result)
 
     def test_open_pr_query_blocks_even_outside_historical_limit(self):
         self.open_prs = [{"number": 200}]
@@ -172,6 +202,33 @@ class CleanupTests(unittest.TestCase):
         with self.subTest("main"):
             self.assert_kept("protected branch")
 
+    def test_primary_checkout_on_closed_pr_branch_cannot_be_removed(self):
+        self.git("checkout", "-b", "primary-feature")
+        self.prs[0]["headRefOid"] = self.base
+        candidate = {"eligible": True, "path": str(self.root), "repo_root": str(self.root),
+                     "branch": "primary-feature", "tip": self.base}
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertIn("primary checkout", result["reason"])
+        self.assertFalse(result["worktree_removed"])
+        self.assertFalse(result["branch_removed"])
+        self.assertTrue((self.root / "file.txt").is_file())
+        self.assertEqual(self.git("rev-parse", "primary-feature").strip(), self.base)
+
+    def test_primary_checkout_with_separate_git_dir_is_kept(self):
+        primary = Path(self.temp.name) / "separate-primary"
+        metadata = Path(self.temp.name) / "separate-metadata"
+        self.git("init", "--separate-git-dir", str(metadata), str(primary))
+        self.git("config", "user.email", "test@example.invalid", cwd=primary)
+        self.git("config", "user.name", "Test", cwd=primary)
+        self.git("checkout", "-b", "primary-feature", cwd=primary)
+        self.git("commit", "--allow-empty", "-m", "primary", cwd=primary)
+        result = cleanup.evaluate(str(primary), str(primary))
+        self.assertFalse(result["eligible"], result)
+        self.assertIn("linked worktree", result["reason"])
+        self.assertTrue((primary / ".git").is_file())
+        self.assertTrue(metadata.is_dir())
+
     def test_locked_and_wrong_repository_are_kept(self):
         self.git("worktree", "lock", str(self.target))
         self.assert_kept("locked")
@@ -242,12 +299,16 @@ class CleanupTests(unittest.TestCase):
         self.prs[0]["headRefOid"] = self.base
         self.assert_kept("remote unavailable")
 
-    def test_removal_revalidates_and_retains_branch(self):
+    def test_removal_revalidates_and_removes_only_local_branch(self):
+        self.git("update-ref", "refs/remotes/origin/feature", self.tip)
+        self.git("config", "branch.feature.remote", "origin")
         result = cleanup.remove_candidate(self.evaluate(), lambda: True)
-        self.assertEqual(result["outcome"], "removed", result)
+        self.assert_branch_removed(result)
         self.assertFalse(self.target.exists())
-        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/feature").strip(), self.tip)
+        self.assertEqual(self.git("config", "branch.feature.remote").strip(), "origin")
         self.assertFalse(any("--force" in call or "prune" in call or "fetch" in call for call in self.calls))
+        self.assertFalse(any(call[:2] == ["git", "push"] for call in self.calls))
 
     def test_removal_includes_ignored_nested_virtualenvs_and_node_modules(self):
         (self.root / ".git" / "info" / "exclude").write_text("**/.venv/\n**/node_modules/\n")
@@ -259,11 +320,10 @@ class CleanupTests(unittest.TestCase):
             path.write_text("generated dependency\n")
         candidate = self.evaluate()
         result = cleanup.remove_candidate(candidate, lambda: True)
-        self.assertEqual(result["outcome"], "removed", result)
+        self.assert_branch_removed(result)
         self.assertFalse(self.target.exists())
         self.assertFalse(Path(candidate["git_dir"]).exists())
         self.assertNotIn(str(self.target), self.git("worktree", "list", "--porcelain"))
-        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
 
     def test_removal_verification_can_outlive_recorded_repository_root(self):
         candidate = cleanup.evaluate(str(self.target), str(self.target))
@@ -312,6 +372,9 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("removal may be incomplete", result["reason"])
         self.assertTrue(self.target.exists())
         self.assertFalse((self.target / ".git").exists())
+        self.assertFalse(result["worktree_removed"])
+        self.assertFalse(result["branch_removed"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
 
     def test_successful_command_must_remove_checkout(self):
         candidate = self.evaluate()
@@ -356,6 +419,175 @@ class CleanupTests(unittest.TestCase):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assertEqual(result["outcome"], "failed", result)
         self.assertIn("left the worktree Git metadata", result["reason"])
+
+    def test_branch_tip_changed_during_worktree_removal_is_retained(self):
+        newer = self.git("commit-tree", self.base + "^{tree}", "-p", self.tip, "-m", "new commit").strip()
+        result = self.remove_then(lambda: self.git("update-ref", "refs/heads/feature", newer))
+        self.assert_only_worktree_removed(result)
+        self.assertIn("branch tip changed", result["reason"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), newer)
+
+    def test_atomic_branch_deletion_preserves_tip_changed_after_checks(self):
+        candidate = self.evaluate()
+        newer = self.git("commit-tree", self.base + "^{tree}", "-p", self.tip, "-m", "racing commit").strip()
+        original_run = subprocess.run
+
+        def change_before_delete(argv, **kwargs):
+            if argv[:4] == ["git", "update-ref", "--no-deref", "-d"]:
+                self.git("update-ref", "refs/heads/feature", newer)
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=change_before_delete):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("git update-ref failed", result["reason"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), newer)
+
+    def test_branch_checked_out_elsewhere_during_removal_is_retained(self):
+        other = Path(self.temp.name) / "reused"
+        result = self.remove_then(lambda: self.git("worktree", "add", str(other), "feature"))
+        self.assert_only_worktree_removed(result)
+        self.assertIn("checked out in another worktree", result["reason"])
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=other).strip(), self.tip)
+
+    def test_detached_rebase_and_bisect_keep_branch(self):
+        other = Path(self.temp.name) / "detached"
+        self.git("worktree", "add", "--detach", str(other), self.tip)
+        metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=other).strip())
+        for state in ("rebase-merge", "rebase-apply", "BISECT_START"):
+            with self.subTest(state=state):
+                marker = metadata / state
+                if state == "BISECT_START":
+                    marker.write_text("feature\n")
+                else:
+                    marker.mkdir()
+                    (marker / "head-name").write_text("refs/heads/feature\n")
+                result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+                self.assert_only_worktree_removed(result)
+                self.assertIn("active rebase or bisect", result["reason"])
+                self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+                if marker.is_dir():
+                    shutil.rmtree(marker)
+                else:
+                    marker.unlink()
+                self.git("worktree", "add", str(self.target), "feature")
+
+    def test_unreadable_worktree_metadata_keeps_branch(self):
+        other = Path(self.temp.name) / "detached"
+        self.git("worktree", "add", "--detach", str(other), self.tip)
+        metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=other).strip())
+        original_listdir = cleanup.os.listdir
+
+        def deny_metadata(path):
+            if Path(path) == metadata:
+                raise PermissionError("worktree metadata is unreadable")
+            return original_listdir(path)
+
+        with patch.object(cleanup.os, "listdir", side_effect=deny_metadata):
+            result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("worktree metadata could not be read", result["reason"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+
+    def test_unreadable_head_or_gitdir_keeps_branch(self):
+        other = Path(self.temp.name) / "detached"
+        self.git("worktree", "add", "--detach", str(other), self.tip)
+        metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=other).strip())
+        original_read = Path.read_text
+        for name in ("HEAD", "gitdir"):
+            with self.subTest(name=name):
+                def deny_file(path, *args, **kwargs):
+                    if path == metadata / name:
+                        raise PermissionError("metadata file is unreadable")
+                    return original_read(path, *args, **kwargs)
+                with patch.object(Path, "read_text", autospec=True, side_effect=deny_file):
+                    result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+                self.assert_only_worktree_removed(result)
+                self.assertIn("worktree metadata could not be read", result["reason"])
+                self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+                self.git("worktree", "add", str(self.target), "feature")
+
+    def test_incomplete_worktree_record_keeps_branch(self):
+        candidate = self.evaluate()
+        original_worktrees = cleanup._worktrees
+
+        def incomplete_after_removal(root):
+            records = original_worktrees(root)
+            if not self.target.exists():
+                records[0].pop("branch")
+            return records
+
+        with patch.object(cleanup, "_worktrees", side_effect=incomplete_after_removal):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("no verifiable branch state", result["reason"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+
+    def test_metadata_head_protects_branch_if_worktree_list_omits_it(self):
+        candidate = self.evaluate()
+        other = Path(self.temp.name) / "reused"
+        self.git("worktree", "add", "--force", str(other), "feature")
+        original_worktrees = cleanup._worktrees
+
+        def omit_other(root):
+            return [record for record in original_worktrees(root)
+                    if Path(record["worktree"]).resolve() != other.resolve()]
+
+        with patch.object(cleanup, "_worktrees", side_effect=omit_other):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("checked out in another worktree", result["reason"])
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=other).strip(), self.tip)
+
+    def test_post_removal_policy_changes_keep_branch(self):
+        changes = (
+            ("open PR", lambda: self.open_prs.append({"number": 2})),
+            ("default branch", lambda: setattr(self, "default", "feature")),
+            ("no closed or merged PR", lambda: self.prs.clear()),
+            ("GitHub unavailable", lambda: setattr(self, "network_failure", "gh")),
+            ("remote branch is absent", lambda: self.prs[0].update(headRefOid=self.base)),
+        )
+        for reason, change in changes:
+            with self.subTest(reason=reason):
+                result = self.remove_then(change)
+                self.assert_only_worktree_removed(result)
+                self.assertIn(reason, result["reason"])
+                self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+                self.open_prs = []
+                self.default = "main"
+                self.network_failure = None
+                self.prs = [{"number": 1, "state": "MERGED", "headRefOid": self.tip}]
+                self.git("worktree", "add", str(self.target), "feature")
+
+    def test_branch_delete_failure_preserves_branch_and_reflog(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def fail_branch_delete(argv, **kwargs):
+            if argv[:4] == ["git", "update-ref", "--no-deref", "-d"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cannot lock ref")
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=fail_branch_delete):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("cannot lock ref", result["reason"])
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+        self.assertTrue((self.root / ".git" / "logs" / "refs" / "heads" / "feature").is_file())
+
+    def test_branch_delete_success_is_verified(self):
+        candidate = self.evaluate()
+        original_run = subprocess.run
+
+        def leave_branch(argv, **kwargs):
+            if argv[:4] == ["git", "update-ref", "--no-deref", "-d"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return original_run(argv, **kwargs)
+
+        with patch.object(cleanup.subprocess, "run", side_effect=leave_branch):
+            result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn("still exists after deletion", result["reason"])
 
     def test_moved_head_is_kept_even_if_new_tip_is_also_recoverable(self):
         candidate = self.evaluate()

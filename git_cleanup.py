@@ -164,60 +164,67 @@ def _gh_json(args, root):
         raise CheckError("GitHub returned invalid JSON") from exc
 
 
+def _check_branch_policy(candidate, root):
+    """Require a recoverable branch with only closed or merged GitHub PRs."""
+    branch, tip = candidate["branch"], candidate["tip"]
+    if branch in ("main", "master"):
+        raise CheckError("protected branch: " + branch)
+    origin = _git(["remote", "get-url", "origin"], root).strip()
+    repo = _github_repo(origin)
+    candidate.update({"origin": origin, "github_repo": repo})
+    # `repo view` accepts its repository positionally; PR commands use --repo.
+    info = _gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], root)
+    default = info["defaultBranchRef"]["name"]
+    if not isinstance(default, str) or not default:
+        raise CheckError("GitHub default branch could not be established")
+    if branch == default:
+        raise CheckError("GitHub default branch cannot be removed")
+    base = ["pr", "list", "--repo", repo, "--head", branch]
+    opened = _gh_json(base + ["--state", "open", "--limit", "1", "--json", "number"], root)
+    if not isinstance(opened, list):
+        raise CheckError("GitHub returned an invalid open PR list")
+    if opened:
+        raise CheckError("branch has an open PR")
+    prs = _gh_json(base + ["--state", "all", "--limit", "100", "--json",
+                           "number,state,headRefOid,url"], root)
+    if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+        raise CheckError("GitHub returned an invalid PR list")
+    if any(pr.get("state") == "OPEN" for pr in prs):
+        raise CheckError("branch has an open PR")
+    closed = [pr for pr in prs if pr.get("state") in ("CLOSED", "MERGED")]
+    if not closed:
+        raise CheckError("branch has no closed or merged PR")
+    candidate["prs"] = closed
+    matching = next((pr for pr in closed if pr.get("headRefOid") == tip), None)
+    if matching:
+        candidate["pr"] = matching
+        candidate["recoverability"] = "local tip is a closed or merged PR head"
+    else:
+        remote_ref = "refs/heads/" + branch
+        response = _git(["ls-remote", "--heads", "origin", remote_ref], root)
+        refs = [line.split() for line in response.splitlines() if line.strip()]
+        if len(refs) != 1 or len(refs[0]) != 2 or refs[0][1] != remote_ref:
+            raise CheckError("local tip is not a PR head and remote branch is absent or ambiguous")
+        remote_tip = refs[0][0]
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", remote_tip):
+            raise CheckError("remote returned an invalid commit ID")
+        _git(["cat-file", "-e", remote_tip + "^{commit}"], root)
+        try:
+            _git(["merge-base", "--is-ancestor", tip, remote_tip], root)
+        except CheckError as exc:
+            raise CheckError("local commits are not proven pushed to the current remote branch") from exc
+        candidate["pr"] = closed[0]
+        candidate["remote_tip"] = remote_tip
+        candidate["recoverability"] = "local tip is contained in the current remote branch"
+    candidate.update({"eligible": True, "reason": "closed or merged PR; clean and recoverable"})
+
+
 def evaluate(checkout: str, repo_root: str) -> dict:
     """Inspect one target only. Any uncertainty keeps it; no refs are fetched."""
     candidate = {"eligible": False, "reason": "eligibility checks incomplete"}
     try:
         candidate.update(_inspect(checkout, repo_root))
-        root, branch, tip = candidate["repo_root"], candidate["branch"], candidate["tip"]
-        origin = _git(["remote", "get-url", "origin"], root).strip()
-        repo = _github_repo(origin)
-        candidate.update({"origin": origin, "github_repo": repo})
-        # `repo view` accepts its repository positionally; PR commands use --repo.
-        info = _gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], root)
-        default = info["defaultBranchRef"]["name"]
-        if not isinstance(default, str) or not default:
-            raise CheckError("GitHub default branch could not be established")
-        if branch == default:
-            raise CheckError("GitHub default branch cannot be removed")
-        base = ["pr", "list", "--repo", repo, "--head", branch]
-        opened = _gh_json(base + ["--state", "open", "--limit", "1", "--json", "number"], root)
-        if not isinstance(opened, list):
-            raise CheckError("GitHub returned an invalid open PR list")
-        if opened:
-            raise CheckError("branch has an open PR")
-        prs = _gh_json(base + ["--state", "all", "--limit", "100", "--json",
-                               "number,state,headRefOid,url"], root)
-        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
-            raise CheckError("GitHub returned an invalid PR list")
-        if any(pr.get("state") == "OPEN" for pr in prs):
-            raise CheckError("branch has an open PR")
-        closed = [pr for pr in prs if pr.get("state") in ("CLOSED", "MERGED")]
-        if not closed:
-            raise CheckError("branch has no closed or merged PR")
-        candidate["prs"] = closed
-        matching = next((pr for pr in closed if pr.get("headRefOid") == tip), None)
-        if matching:
-            candidate["pr"] = matching
-            candidate["recoverability"] = "local tip is a closed or merged PR head"
-        else:
-            remote_ref = "refs/heads/" + branch
-            response = _git(["ls-remote", "--heads", "origin", remote_ref], root)
-            refs = [line.split() for line in response.splitlines() if line.strip()]
-            if len(refs) != 1 or len(refs[0]) != 2 or refs[0][1] != remote_ref:
-                raise CheckError("local tip is not a PR head and remote branch is absent or ambiguous")
-            remote_tip = refs[0][0]
-            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", remote_tip):
-                raise CheckError("remote returned an invalid commit ID")
-            _git(["cat-file", "-e", remote_tip + "^{commit}"], root)
-            try:
-                _git(["merge-base", "--is-ancestor", tip, remote_tip], root)
-            except CheckError as exc:
-                raise CheckError("local commits are not proven pushed to the current remote branch") from exc
-            candidate["pr"] = closed[0]
-            candidate["remote_tip"] = remote_tip
-            candidate["recoverability"] = "local tip is contained in the current remote branch"
-        candidate.update({"eligible": True, "reason": "closed or merged PR; clean and recoverable"})
+        _check_branch_policy(candidate, candidate["repo_root"])
     except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
         candidate["reason"] = str(exc) or "eligibility check failed"
     return candidate
@@ -243,9 +250,52 @@ def _final_unchanged(candidate):
     return not _git(["status", "--porcelain=v1", "--untracked-files=all"], path).strip()
 
 
+def _remove_branch(candidate):
+    root, branch, tip = candidate["common_dir"], candidate["branch"], candidate["tip"]
+    policy = dict(candidate)
+    _check_branch_policy(policy, root)
+    if any(policy.get(key) != candidate.get(key) for key in ("origin", "github_repo")):
+        raise CheckError("origin changed during worktree removal")
+    ref = "refs/heads/" + branch
+    if _git(["rev-parse", "--verify", ref], root).strip() != tip:
+        raise CheckError("local branch tip changed during worktree removal")
+    for record in _worktrees(root):
+        if not record.get("branch") and "detached" not in record and "bare" not in record:
+            raise CheckError("a worktree has no verifiable branch state")
+        if record.get("branch") == ref:
+            raise CheckError("local branch is checked out in another worktree")
+    try:
+        linked_dirs = list((Path(root) / "worktrees").iterdir())
+    except FileNotFoundError:
+        linked_dirs = []
+    git_dirs = [Path(root)] + linked_dirs
+    for git_dir in git_dirs:
+        try:
+            entries = os.listdir(git_dir)
+            head = (git_dir / "HEAD").read_text().strip()
+            if git_dir != Path(root):
+                pointer = (git_dir / "gitdir").read_text().strip()
+                if not pointer or not os.path.isabs(pointer):
+                    raise CheckError("linked worktree gitdir metadata is invalid")
+        except (OSError, UnicodeError) as exc:
+            raise CheckError("worktree metadata could not be read: " + type(exc).__name__) from exc
+        symbolic = re.fullmatch(r"ref: (refs/heads/\S+)", head)
+        if symbolic:
+            if symbolic.group(1) == ref:
+                raise CheckError("local branch is checked out in another worktree")
+        elif not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            raise CheckError("worktree HEAD metadata is invalid")
+        if {"rebase-merge", "rebase-apply", "BISECT_START"}.intersection(entries):
+            raise CheckError("a worktree has an active rebase or bisect")
+    # Compare-and-delete the exact local ref; never follow a replacement symref.
+    _git(["update-ref", "--no-deref", "-d", ref, tip], root)
+    if ref in _git(["for-each-ref", "--format=%(refname)", "--", ref], root).splitlines():
+        raise CheckError("local branch still exists after deletion")
+
+
 def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
-    """Recheck eligibility and identity before removing; retain the local branch."""
-    result = dict(candidate, outcome="kept")
+    """Recheck eligibility before removing the checkout and its unchanged local branch."""
+    result = dict(candidate, outcome="kept", worktree_removed=False, branch_removed=False)
     if not candidate.get("eligible"):
         return dict(result, reason="initial candidate is not eligible")
     try:
@@ -267,7 +317,7 @@ def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
         # wait, immediately before Git's own non-forced cleanliness guard.
         if not _final_unchanged(candidate):
             return dict(result, reason="worktree identity, branch, HEAD, or status changed during usage check")
-        result = dict(current, outcome="failed")
+        result = dict(current, outcome="failed", worktree_removed=False, branch_removed=False)
         # Removal can take arbitrarily long for ignored dependency directories.
         # Killing it on a check deadline can leave a partially deleted checkout.
         _git(["worktree", "remove", "--", candidate["path"]], candidate["repo_root"], timeout=None)
@@ -278,9 +328,14 @@ def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
             raise CheckError("git worktree remove left the worktree registration")
         if os.path.lexists(candidate["git_dir"]):
             raise CheckError("git worktree remove left the worktree Git metadata")
-        return dict(current, outcome="removed", reason="removed clean worktree; local branch retained")
+        result["worktree_removed"] = True
+        _remove_branch(candidate)
+        return dict(result, outcome="removed", branch_removed=True,
+                    reason="removed clean worktree and local branch")
     except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
         reason = str(exc) or "removal check failed"
-        if result["outcome"] == "failed":
+        if result["worktree_removed"]:
+            reason += "; worktree removed; local branch cleanup incomplete"
+        elif result["outcome"] == "failed":
             reason += "; removal may be incomplete"
         return dict(result, reason=reason)

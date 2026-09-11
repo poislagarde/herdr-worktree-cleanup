@@ -182,7 +182,7 @@ class Fixtures:
     def assert_removed(self, path, branch):
         assert not path.exists(), "Eligible checkout was retained: {}".format(path)
         assert str(path) not in self.run("worktree", "list", "--porcelain")
-        assert self.run("rev-parse", "--verify", "refs/heads/" + branch), "Branch was deleted"
+        assert not self.run("for-each-ref", "--format=%(refname)", "refs/heads/" + branch), "Branch was retained"
 
 
 def private_environment(root, git):
@@ -270,7 +270,8 @@ def smoke(root, herdr, plugin_dir, servers):
     outcomes = [json.loads(log["stdout"]) for log in first.logs() if log.get("stdout")]
     removed = next(result for result in outcomes if result.get("outcome") == "removed")
     assert removed["notification_delivered"] is True
-    print("PASS: closing the last tab removes checkout and ignored dependencies, retains branch, and sends notification")
+    assert removed["branch_removed"] is True
+    print("PASS: closing the last tab removes checkout, ignored dependencies and local branch, and sends notification")
 
     path = fixtures.worktree("natural-exit", state="CLOSED")
     workspace = first.open_worktree(fixtures.repo, path)
@@ -281,7 +282,7 @@ def smoke(root, herdr, plugin_dir, servers):
     first.run("pane", "send-keys", pane, "enter")
     first.settled(previous, "pane.exited")
     fixtures.assert_removed(path, "natural-exit")
-    print("PASS: natural shell exit triggers cleanup for a closed PR")
+    print("PASS: natural shell exit removes worktree and local branch for a closed, unmerged PR")
 
     path = fixtures.worktree("non-last-tab")
     workspace = first.open_worktree(fixtures.repo, path)

@@ -1,8 +1,8 @@
 id = "poislagarde.worktree-cleanup"
 name = "Worktree Cleanup"
-version = "0.1.1"
+version = "0.2.0"
 min_herdr_version = "0.8.2"
-description = "Remove clean, pushed GitHub PR worktrees after their Herdr space closes."
+description = "Remove clean, pushed GitHub PR worktrees and their local branches after their Herdr space closes."
 platforms = ["linux", "macos"]
 
 [[actions]]

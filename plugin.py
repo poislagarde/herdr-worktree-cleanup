@@ -202,7 +202,7 @@ def run(action):
     if not candidate.get("eligible"):
         return dict(candidate, outcome="kept")
     if action == "check":
-        return dict(candidate, outcome="eligible", reason="Git/PR checks pass; close the space to check usage and clean up")
+        return dict(candidate, outcome="eligible", reason="Git/PR checks pass; close the space to check usage and remove the worktree and local branch")
     # The common Git directory is shared even when provenance names a linked
     # checkout as the repository root. Removal re-evaluates inside this lock.
     with repository_lock(absolute_path(candidate.get("common_dir"))):
@@ -218,12 +218,21 @@ def run(action):
 
         result = remove_candidate(candidate, still_unused)
         if result.get("outcome") == "removed":
-            result["notification_delivered"] = herdr.notify("Worktree removed", checkout)
-        elif result.get("outcome") == "failed":
             result["notification_delivered"] = herdr.notify(
-                "Worktree cleanup failed",
-                checkout + "\n" + result["reason"] + "\nThe checkout may be partially removed; inspect the plugin log.",
+                "Worktree and branch removed", checkout + "\nLocal branch: " + result["branch"],
             )
+        elif result.get("outcome") == "failed":
+            if result.get("worktree_removed"):
+                result["notification_delivered"] = herdr.notify(
+                    "Branch cleanup failed",
+                    checkout + "\nWorktree removed; local branch cleanup incomplete: "
+                    + result["branch"] + "\n" + result["reason"],
+                )
+            else:
+                result["notification_delivered"] = herdr.notify(
+                    "Worktree cleanup failed",
+                    checkout + "\n" + result["reason"] + "\nThe checkout may be partially removed; inspect the plugin log.",
+                )
         return result
 
 
