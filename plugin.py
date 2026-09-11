@@ -14,7 +14,23 @@ import sys
 import tempfile
 import time
 
-from git_cleanup import evaluate, remove_candidate
+from git_cleanup import CheckError, _common, evaluate, remove_candidate
+from registration import inspect_checkout
+
+
+PLUGIN_ID = "poislagarde.worktree-cleanup"
+
+
+def plugin_directory(kind):
+    explicit = os.environ.get("HERDR_PLUGIN_" + kind.upper() + "_DIR")
+    if explicit:
+        return Path(absolute_path(explicit))
+    home = Path.home()
+    if kind == "state":
+        base = Path(os.environ.get("XDG_STATE_HOME", str(home / ".local" / "state")))
+        return Path(absolute_path(str(base))) / "herdr" / "plugins" / PLUGIN_ID
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config")))
+    return Path(absolute_path(str(base))) / "herdr" / "plugins" / "config" / PLUGIN_ID
 
 
 class Keep(Exception):
@@ -35,11 +51,11 @@ def absolute_path(value):
 
 
 class Herdr:
-    def __init__(self):
+    def __init__(self, socket=None):
         self.binary = os.environ.get("HERDR_BIN_PATH", "herdr")
-        self.socket = absolute_path(os.environ.get("HERDR_SOCKET_PATH"))
+        self.socket = absolute_path(socket or os.environ.get("HERDR_SOCKET_PATH"))
 
-    def call(self, *args, socket=None, raw=False):
+    def call(self, *args, socket=None, raw=False, timeout=8):
         env = os.environ.copy()
         env.pop("HERDR_SESSION", None)
         env["HERDR_SOCKET_PATH"] = socket or self.socket
@@ -47,7 +63,7 @@ class Herdr:
             result = subprocess.run(
                 [self.binary, *args], env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=8,
+                text=True, timeout=timeout,
             )
             if result.returncode:
                 raise Keep("Herdr state unavailable: " + " ".join(args[:2]))
@@ -62,8 +78,8 @@ class Herdr:
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
             raise Keep("Herdr state could not be verified") from error
 
-    def workspaces(self, socket=None):
-        result = self.call("workspace", "list", socket=socket).get("workspaces")
+    def workspaces(self, socket=None, timeout=8):
+        result = self.call("workspace", "list", socket=socket, timeout=timeout).get("workspaces")
         if not isinstance(result, list) or not all(isinstance(w, dict) for w in result):
             raise Keep("invalid Herdr workspace list")
         return result
@@ -110,8 +126,19 @@ class Herdr:
 
     def unused(self, checkout, closed_workspace_id=None):
         """Check every discoverable local server, including ordinary pane cwds."""
-        for socket in self.sockets():
+        with registry_state() as data:
+            for request in data["pending"]:
+                record = request["record"]
+                if record["checkout"] == checkout and observed_record(checkout, record["repo"]) == record:
+                    raise Keep("worktree has an unresolved registration; live ownership is uncertain")
+        owners = ownership(checkout)
+        sockets = set(self.sockets())
+        sockets.update(owner["socket"] for owner in owners if os.path.lexists(owner["socket"]))
+        for socket in sorted(sockets):
+            local_owners = [owner for owner in owners if owner["socket"] == socket]
             for workspace in self.workspaces(socket):
+                if any(owner["workspace_id"] == workspace.get("workspace_id") for owner in local_owners):
+                    raise Keep("worktree is still owned by an open Herdr space")
                 if (closed_workspace_id is not None and socket == self.socket
                         and workspace.get("workspace_id") == closed_workspace_id):
                     raise Keep("space was reopened")
@@ -126,6 +153,8 @@ class Herdr:
             for pane in panes:
                 if not isinstance(pane, dict):
                     raise Keep("invalid Herdr pane entry")
+                if any(owner["terminal_id"] == pane.get("terminal_id") for owner in local_owners):
+                    raise Keep("worktree is still owned by a live Herdr terminal")
                 if inside(pane.get("cwd"), checkout) or inside(pane.get("foreground_cwd"), checkout):
                     raise Keep("worktree is still used by a Herdr pane")
                 if not pane.get("cwd") and not pane.get("foreground_cwd"):
@@ -173,19 +202,22 @@ def invocation(action):
             raise Keep("event and context identify different spaces")
         if name == "workspace.closed":
             workspace = data.get("workspace")
-            if not isinstance(workspace, dict) or workspace.get("workspace_id") != workspace_id:
-                raise Keep("closed space has no final snapshot")
-            provenance = workspace.get("worktree")
+            if workspace is not None and (not isinstance(workspace, dict) or workspace.get("workspace_id") != workspace_id):
+                raise Keep("closed space has no valid final snapshot")
+            provenance = workspace.get("worktree") if workspace is not None else None
         else:
             provenance = context.get("worktree")
     if not isinstance(workspace_id, str) or not workspace_id:
         raise Keep("space identifier is missing")
+    if action != "check" and (provenance is None or
+            isinstance(provenance, dict) and provenance.get("is_linked_worktree") is not True):
+        return workspace_id, None, None
     checkout, repo = provenance_paths(provenance)
     return workspace_id, checkout, repo
 
 
 def configured_mode():
-    directory = absolute_path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))
+    directory = plugin_directory("config")
     path = Path(directory) / "config.json"
     try:
         config = object_json(path.read_text())
@@ -202,7 +234,7 @@ def configured_mode():
 
 
 def patterns_path():
-    return str(Path(absolute_path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))) / "disposable.gitignore")
+    return str(plugin_directory("config") / "disposable.gitignore")
 
 
 def observed_record(checkout, repo):
@@ -216,7 +248,7 @@ def observed_record(checkout, repo):
 
 @contextmanager
 def state_lock(name):
-    directory = Path(absolute_path(os.environ.get("HERDR_PLUGIN_STATE_DIR"))) / "locks"
+    directory = plugin_directory("state") / "locks"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(str(directory / name), os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -226,38 +258,69 @@ def state_lock(name):
         os.close(descriptor)
 
 
-def registry(update=None, forget=None):
-    """Atomically merge trusted observations without losing concurrent hook updates."""
-    path = Path(absolute_path(os.environ.get("HERDR_PLUGIN_STATE_DIR"))) / "worktrees.json"
+def valid_record(record):
+    if (not isinstance(record, dict) or set(record) != {"checkout", "repo", "identity"}
+            or not isinstance(record["identity"], list) or len(record["identity"]) != 4
+            or not all(type(value) is int and value >= 0 for value in record["identity"])):
+        raise Keep("invalid worktree provenance record")
+    if any(absolute_path(record[key]) != record[key] for key in ("checkout", "repo")):
+        raise Keep("ambiguous worktree provenance record")
+
+
+def identifier(value):
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise Keep("missing or invalid Herdr identifier")
+    return value
+
+
+@contextmanager
+def registry_state(write=False):
+    """Read v1 without rewriting it; mutations atomically migrate to v2."""
+    path = plugin_directory("state") / "worktrees.json"
     with state_lock("registry.lock"):
         try:
             data = object_json(path.read_text())
         except FileNotFoundError:
-            data = {"version": 1, "worktrees": []}
+            data = {"version": 2, "worktrees": [], "owners": [], "pending": []}
         except (OSError, ValueError) as error:
             raise Keep("cannot read worktree provenance registry") from error
-        if data.get("version") != 1 or not isinstance(data.get("worktrees"), list):
+        if data.get("version") not in (1, 2) or not isinstance(data.get("worktrees"), list):
             raise Keep("invalid worktree provenance registry")
+        if data["version"] == 1:
+            data = dict(data, version=2, owners=[], pending=[])
+        if not isinstance(data.get("owners"), list) or not isinstance(data.get("pending"), list):
+            raise Keep("invalid worktree ownership registry")
         records = {}
         for record in data["worktrees"]:
-            if (not isinstance(record, dict) or set(record) != {"checkout", "repo", "identity"}
-                    or not isinstance(record["identity"], list) or len(record["identity"]) != 4
-                    or not all(type(value) is int and value >= 0 for value in record["identity"])):
-                raise Keep("invalid worktree provenance record")
-            checkout, repo = absolute_path(record["checkout"]), absolute_path(record["repo"])
-            if checkout != record["checkout"] or repo != record["repo"] or checkout in records:
+            valid_record(record)
+            if record["checkout"] in records:
                 raise Keep("ambiguous worktree provenance record")
-            records[checkout] = record
-        for record in update or []:
             records[record["checkout"]] = record
-        if forget and records.get(forget["checkout"]) == forget:
-            records.pop(forget["checkout"])
-        result = sorted(records.values(), key=lambda record: record["checkout"])
-        if update is not None or forget is not None:
+        for owner in data["owners"]:
+            if (not isinstance(owner, dict)
+                    or set(owner) != {"checkout", "socket", "workspace_id", "terminal_id"}
+                    or owner["checkout"] not in records):
+                raise Keep("invalid worktree owner")
+            if absolute_path(owner["socket"]) != owner["socket"]:
+                raise Keep("invalid owner socket")
+            identifier(owner["workspace_id"])
+            identifier(owner["terminal_id"])
+        for request in data["pending"]:
+            if (not isinstance(request, dict) or set(request) != {"record", "socket", "pane_id", "attempts", "retry_after"}
+                    or type(request["attempts"]) is not int or request["attempts"] < 0
+                    or not isinstance(request["retry_after"], (float, int)) or request["retry_after"] < 0):
+                raise Keep("invalid pending registration")
+            valid_record(request["record"])
+            if absolute_path(request["socket"]) != request["socket"]:
+                raise Keep("invalid pending socket")
+            identifier(request["pane_id"])
+        yield data
+        if write:
+            data["worktrees"].sort(key=lambda record: record["checkout"])
             descriptor, temporary = tempfile.mkstemp(prefix=".worktrees-", dir=str(path.parent))
             try:
                 with os.fdopen(descriptor, "w") as output:
-                    json.dump({"version": 1, "worktrees": result}, output, sort_keys=True)
+                    json.dump(data, output, sort_keys=True)
                     output.write("\n")
                     output.flush()
                     os.fsync(output.fileno())
@@ -265,7 +328,180 @@ def registry(update=None, forget=None):
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
-        return result
+
+
+def merge_record(data, record):
+    previous = next((item for item in data["worktrees"] if item["checkout"] == record["checkout"]), None)
+    if previous is not None and previous["identity"] != record["identity"]:
+        data["owners"] = [owner for owner in data["owners"] if owner["checkout"] != record["checkout"]]
+    data["worktrees"] = [item for item in data["worktrees"] if item["checkout"] != record["checkout"]] + [record]
+
+
+def registry(update=None, forget=None):
+    with registry_state(write=update is not None or forget is not None) as data:
+        for record in update or []:
+            merge_record(data, record)
+        if forget and forget in data["worktrees"]:
+            data["worktrees"].remove(forget)
+            data["owners"] = [owner for owner in data["owners"] if owner["checkout"] != forget["checkout"]]
+        return sorted(data["worktrees"], key=lambda record: record["checkout"])
+
+
+def ownership(checkout=None):
+    with registry_state() as data:
+        return [dict(owner) for owner in data["owners"] if checkout is None or owner["checkout"] == checkout]
+
+
+def owner_records(socket, workspace_id):
+    with registry_state() as data:
+        paths = {owner["checkout"] for owner in data["owners"]
+                 if owner["socket"] == socket and owner["workspace_id"] == workspace_id}
+        return [dict(record) for record in data["worktrees"] if record["checkout"] in paths]
+
+
+def resolve_owner(herdr, socket, pane_id, checkout):
+    pane = herdr.call("pane", "get", pane_id, socket=socket, timeout=1.5).get("pane")
+    if not isinstance(pane, dict):
+        raise Keep("registration pane could not be verified")
+    workspace_id = identifier(pane.get("workspace_id"))
+    terminal_id = identifier(pane.get("terminal_id"))
+    if not any(workspace.get("workspace_id") == workspace_id for workspace in herdr.workspaces(socket, timeout=1.5)):
+        raise Keep("registration space is no longer open")
+    return {"checkout": checkout, "socket": socket,
+            "workspace_id": workspace_id, "terminal_id": terminal_id}
+
+
+def register(checkout, defer=False):
+    socket = absolute_path(os.environ.get("HERDR_SOCKET_PATH"))
+    pane_id = identifier(os.environ.get("HERDR_PANE_ID"))
+    record = inspect_checkout(checkout)
+    request = {"record": record, "socket": socket, "pane_id": pane_id, "attempts": 0, "retry_after": 0}
+    # Registration and disposal share the same lock order: repository, registry.
+    # An accepted new owner cannot race the final unused check and deletion.
+    with repository_lock(_common(record["repo"])):
+        if inspect_checkout(record["checkout"]) != record:
+            raise Keep("worktree identity changed during registration")
+        with registry_state(write=True) as data:
+            try:
+                owner = resolve_owner(Herdr(), socket, pane_id, record["checkout"])
+            except Keep as error:
+                if not defer:
+                    raise
+                if not any(same_request(item, request) for item in data["pending"]):
+                    data["pending"].append(request)
+                return {"outcome": "pending", "path": record["checkout"], "reason": str(error)}
+            if inspect_checkout(record["checkout"]) != record:
+                raise Keep("worktree identity changed during registration")
+            merge_record(data, record)
+            if owner not in data["owners"]:
+                data["owners"].append(owner)
+            data["pending"] = [item for item in data["pending"] if not same_request(item, request)]
+            return {"outcome": "registered", "path": record["checkout"], "workspace_id": owner["workspace_id"]}
+
+
+def same_request(first, second):
+    return all(first[key] == second[key] for key in ("record", "socket", "pane_id"))
+
+
+class StaleRegistration(Keep):
+    """Positive evidence that a request no longer names its original checkout."""
+
+
+def inspect_request(record):
+    try:
+        directory = os.lstat(record["checkout"])
+        marker = os.lstat(os.path.join(record["checkout"], ".git"))
+    except FileNotFoundError as error:
+        raise StaleRegistration("pending worktree is absent; register it again if recreated") from error
+    identity = [directory.st_dev, directory.st_ino, marker.st_dev, marker.st_ino]
+    if (identity != record["identity"] or not stat.S_ISDIR(directory.st_mode)
+            or not stat.S_ISREG(marker.st_mode)):
+        raise StaleRegistration("pending worktree identity changed; register it again")
+    if inspect_checkout(record["checkout"]) != record:
+        raise StaleRegistration("pending Git identity changed; register it again")
+
+
+def delay_request(data, request):
+    if request in data["pending"]:
+        item = data["pending"][data["pending"].index(request)]
+        item["attempts"] += 1
+        item["retry_after"] = time.time() + min(3600, 30 * 2 ** min(item["attempts"] - 1, 7))
+
+
+def drain():
+    results = []
+    with registry_state() as data:
+        requests = [dict(item) for item in data["pending"] if item["retry_after"] <= time.time()][:4]
+    for request in requests:
+        record = request["record"]
+        try:
+            inspect_request(record)
+            common = _common(record["repo"])
+        except (Keep, CheckError, OSError, ValueError) as error:
+            rejected = isinstance(error, StaleRegistration)
+            with registry_state(write=True) as data:
+                if rejected:
+                    data["pending"] = [item for item in data["pending"] if item != request]
+                else:
+                    delay_request(data, request)
+            results.append({"outcome": "rejected" if rejected else "pending",
+                            "path": record["checkout"], "reason": str(error)})
+            continue
+        with repository_lock(common):
+            with registry_state(write=True) as data:
+                if request not in data["pending"]:
+                    continue
+                try:
+                    inspect_request(record)
+                    owner = resolve_owner(Herdr(request["socket"]), request["socket"], request["pane_id"], record["checkout"])
+                    inspect_request(record)
+                except (Keep, CheckError, OSError, ValueError) as error:
+                    rejected = isinstance(error, StaleRegistration)
+                    if rejected:
+                        data["pending"].remove(request)
+                    else:
+                        delay_request(data, request)
+                    results.append({"outcome": "rejected" if rejected else "pending",
+                                    "path": record["checkout"], "reason": str(error)})
+                    continue
+                merge_record(data, record)
+                if owner not in data["owners"]:
+                    data["owners"].append(owner)
+                data["pending"].remove(request)
+                results.append({"outcome": "registered", "path": record["checkout"],
+                                "workspace_id": owner["workspace_id"]})
+    with registry_state() as data:
+        pending = len(data["pending"])
+    return {"outcome": "drained", "registered": sum(item["outcome"] == "registered" for item in results),
+            "pending": pending, "results": results}
+
+
+def sync_owners(herdr):
+    """Follow the same terminal after a pane moves to a different space."""
+    owners = ownership()
+    if not owners:
+        return
+    current = {}
+    for socket in sorted({owner["socket"] for owner in owners}):
+        if socket not in herdr.sockets() and not os.path.lexists(socket):
+            continue
+        panes = herdr.call("pane", "list", socket=socket).get("panes")
+        if not isinstance(panes, list):
+            raise Keep("invalid Herdr pane list")
+        for pane in panes:
+            if not isinstance(pane, dict):
+                raise Keep("invalid Herdr pane entry")
+            if pane.get("terminal_id"):
+                key = (socket, identifier(pane["terminal_id"]))
+                workspace = identifier(pane.get("workspace_id"))
+                if key in current and current[key] != workspace:
+                    raise Keep("ambiguous terminal ownership")
+                current[key] = workspace
+    with registry_state(write=True) as data:
+        for owner in data["owners"]:
+            workspace = current.get((owner["socket"], owner["terminal_id"]))
+            if workspace:
+                owner["workspace_id"] = workspace
 
 
 @contextmanager
@@ -368,6 +604,7 @@ def run(action):
         observations = herdr.observed()
         if action == "observe":
             registry(update=observations)
+            sync_owners(herdr)
             return {"outcome": "observed", "recorded": len(observations),
                     "reason": "recorded live Herdr worktree provenance; no cleanup performed"}
         dry_run = action == "check-unused"
@@ -393,20 +630,33 @@ def run(action):
         return response
 
     workspace_id, checkout, repo = invocation(action)
-    record = observed_record(checkout, repo)
-    if action == "check":
-        return cleanup(Herdr(), record, dry_run=True, active_check=True)
-    registry(update=[record])
     herdr = Herdr()
+    record = observed_record(checkout, repo) if checkout is not None else None
+    if action == "check":
+        return cleanup(herdr, record, dry_run=True, active_check=True)
+    if record is not None:
+        registry(update=[record])
     # A non-last pane exit is ordinary activity, not a skipped cleanup warning.
     herdr.wait_closed(workspace_id)
-    try:
-        result = cleanup(herdr, record, workspace_id=workspace_id)
-    except (Keep, OSError, ValueError) as error:
-        result = {"outcome": "kept", "path": checkout, "reason": str(error)}
-    if result.get("worktree_removed"):
-        registry(forget=record)
-    return notify_result(herdr, result)
+    sync_owners(herdr)
+    records = {item["checkout"]: item for item in owner_records(herdr.socket, workspace_id)}
+    if record is not None:
+        records[record["checkout"]] = record
+    if not records:
+        raise Keep("closed space has no recorded linked worktrees")
+    results = []
+    for record in sorted(records.values(), key=lambda item: item["checkout"]):
+        try:
+            result = cleanup(herdr, record, workspace_id=workspace_id)
+        except (Keep, OSError, ValueError) as error:
+            result = {"outcome": "kept", "path": record["checkout"], "reason": str(error)}
+        if result.get("worktree_removed"):
+            registry(forget=record)
+        results.append(result)
+    if len(results) == 1:
+        return notify_result(herdr, results[0])
+    return {"outcome": "failed" if any(item["outcome"] == "failed" for item in results) else "cleaned",
+            "results": results, "notification_delivered": notify_sweep(herdr, results)}
 
 
 def public_result(value):
@@ -426,11 +676,22 @@ def public_result(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["event", "check", "observe", "clean-unused", "check-unused"])
-    action = parser.parse_args().action
+    parser.add_argument("action", choices=["event", "check", "observe", "clean-unused", "check-unused", "register", "drain"])
+    parser.add_argument("--checkout")
+    parser.add_argument("--defer-on-unavailable", action="store_true")
+    args = parser.parse_args()
+    if (args.action == "register") != bool(args.checkout):
+        parser.error("--checkout is required only for register")
+    if args.defer_on_unavailable and args.action != "register":
+        parser.error("--defer-on-unavailable requires register")
     try:
-        result = run(action)
-    except (Keep, OSError, ValueError) as error:
+        if args.action == "register":
+            result = register(args.checkout, args.defer_on_unavailable)
+        elif args.action == "drain":
+            result = drain()
+        else:
+            result = run(args.action)
+    except (Keep, CheckError, OSError, ValueError) as error:
         result = {"outcome": "kept", "reason": str(error)}
     print(json.dumps(public_result(result), sort_keys=True))
     return 1 if result.get("outcome") == "failed" else 0
