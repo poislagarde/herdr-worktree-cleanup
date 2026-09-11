@@ -24,6 +24,8 @@ class PluginTests(unittest.TestCase):
         self.repo = str(self.root / "repository")
         self.common_dir = str(self.root / "repository" / ".git")
         Path(self.common_dir).mkdir(parents=True)
+        Path(self.checkout).mkdir()
+        (Path(self.checkout) / ".git").write_text("gitdir: " + self.common_dir + "/worktrees/feature\n")
         self.socket = str(self.root / "current.sock")
         self.other_socket = str(self.root / "other.sock")
         self.config = self.root / "config"
@@ -120,8 +122,12 @@ class PluginTests(unittest.TestCase):
         return dict(candidate, outcome="removed", worktree_removed=True, branch_removed=True)
 
     def assert_kept_before_git(self):
-        with self.assertRaises(plugin.Keep):
-            plugin.run("event")
+        try:
+            result = plugin.run("event")
+        except plugin.Keep:
+            pass
+        else:
+            self.assertEqual(result["outcome"], "kept")
         self.evaluate.assert_not_called()
         self.remove_candidate.assert_not_called()
 
@@ -159,7 +165,7 @@ class PluginTests(unittest.TestCase):
         self.context.pop("worktree")
         self.set_event()
         plugin.run("event")
-        self.evaluate.assert_called_once_with(self.checkout, self.repo)
+        self.evaluate.assert_called_once_with(self.checkout, self.repo, patterns_path=str(self.config / "disposable.gitignore"))
 
     def test_missing_or_nonlinked_provenance_is_kept(self):
         for provenance in (None, {}, {"is_linked_worktree": False}, {"is_linked_worktree": 1}):
@@ -181,7 +187,7 @@ class PluginTests(unittest.TestCase):
         self.pane_exit()
         result = plugin.run("event")
         self.assertEqual(result["outcome"], "removed")
-        self.evaluate.assert_called_once_with(self.checkout, self.repo)
+        self.evaluate.assert_called_once_with(self.checkout, self.repo, patterns_path=str(self.config / "disposable.gitignore"))
 
     def test_pane_exit_without_context_provenance_is_kept(self):
         self.context.pop("worktree")
@@ -282,7 +288,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(plugin.run("event")["outcome"], "removed")
 
     def test_symlinked_pane_path_inside_worktree_keeps_checkout(self):
-        Path(self.checkout).mkdir()
+        Path(self.checkout).mkdir(exist_ok=True)
         link = self.root / "alias"
         link.symlink_to(self.checkout)
         self.panes[self.socket] = [{"cwd": str(link / "src")}]
@@ -340,8 +346,7 @@ class PluginTests(unittest.TestCase):
             self.fail("guard accepted a reopened space")
 
         self.remove_candidate.side_effect = reopen
-        with self.assertRaisesRegex(plugin.Keep, "reopened"):
-            plugin.run("event")
+        self.assertIn("reopened", plugin.run("event")["reason"])
 
     def test_new_pane_before_removal_blocks_cleanup(self):
         def start_pane(candidate, unused):
@@ -350,24 +355,24 @@ class PluginTests(unittest.TestCase):
             self.fail("guard accepted a new pane in the checkout")
 
         self.remove_candidate.side_effect = start_pane
-        with self.assertRaisesRegex(plugin.Keep, "Herdr pane"):
-            plugin.run("event")
+        self.assertIn("Herdr pane", plugin.run("event")["reason"])
 
     def test_switching_to_notify_during_checks_blocks_removal(self):
-        def disable_removal(checkout, repo):
+        def disable_removal(checkout, repo, **kwargs):
             self.configure({"mode": "notify"})
             return self.candidate
 
         self.evaluate.side_effect = disable_removal
-        with self.assertRaisesRegex(plugin.Keep, "disabled during"):
-            plugin.run("event")
-        self.assertFalse(any(command[:2] == ("notification", "show") for _, command in self.calls))
+        self.assertIn("disabled during", plugin.run("event")["reason"])
+        self.assertTrue(any(command[:2] == ("notification", "show") for _, command in self.calls))
 
-    def test_ineligible_worktree_is_kept_without_notification(self):
+    def test_ineligible_worktree_reports_checkout_and_blockers(self):
         self.evaluate.return_value = {"eligible": False, "reason": "dirty"}
-        self.assertEqual(plugin.run("event"), {"eligible": False, "reason": "dirty", "outcome": "kept"})
+        result = plugin.run("event")
+        self.assertEqual(result["outcome"], "kept")
+        self.assertEqual(result["path"], self.checkout)
+        self.assertTrue(result["notification_delivered"])
         self.remove_candidate.assert_not_called()
-        self.assertFalse(any(command[:2] == ("notification", "show") for _, command in self.calls))
 
     def test_check_never_removes_even_in_auto_mode_with_open_space(self):
         self.workspaces[self.socket] = [{"workspace_id": "closed", "worktree": self.provenance}]
@@ -375,7 +380,7 @@ class PluginTests(unittest.TestCase):
         os.environ.pop("HERDR_PLUGIN_EVENT")
         os.environ.pop("HERDR_PLUGIN_EVENT_JSON")
         self.assertEqual(plugin.run("check")["outcome"], "eligible")
-        self.evaluate.assert_called_once_with(self.checkout, self.repo)
+        self.evaluate.assert_called_once_with(self.checkout, self.repo, patterns_path=str(self.config / "disposable.gitignore"))
         self.remove_candidate.assert_not_called()
         self.assertEqual(self.calls, [])
 
@@ -415,7 +420,7 @@ class PluginTests(unittest.TestCase):
                 with mock.patch.object(plugin, "repository_lock", wraps=plugin.repository_lock) as lock:
                     self.assertEqual(plugin.run("event")["outcome"], "removed")
                 lock.assert_called_once_with(self.common_dir)
-                self.evaluate.assert_called_with(self.checkout, recorded_root)
+                self.evaluate.assert_called_with(self.checkout, recorded_root, patterns_path=str(self.config / "disposable.gitignore"))
 
     def test_notification_failure_does_not_hide_successful_removal(self):
         command = ("notification", "show", "Worktree and branch removed", "--body",
@@ -476,6 +481,164 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "kept")
         self.assertTrue(result["reason"])
         self.remove_candidate.assert_not_called()
+
+    def observe_checkout(self):
+        self.workspaces[self.socket] = [{"workspace_id": "live", "worktree": self.provenance}]
+        result = plugin.run("observe")
+        self.assertEqual(result["outcome"], "observed")
+        self.workspaces[self.socket] = []
+
+    def test_observe_records_authoritative_live_metadata_without_evaluating(self):
+        self.observe_checkout()
+        self.assertEqual(plugin.registry(), [plugin.observed_record(self.checkout, self.repo)])
+        self.evaluate.assert_not_called()
+        self.remove_candidate.assert_not_called()
+
+    def test_observe_ignores_ordinary_pane_paths_without_worktree_provenance(self):
+        self.workspaces[self.socket] = [{"workspace_id": "ordinary"}]
+        self.panes[self.socket] = [{"cwd": self.checkout}]
+        self.assertEqual(plugin.run("observe")["recorded"], 0)
+        self.assertEqual(plugin.registry(), [])
+
+    def test_observe_discovers_other_local_sessions_without_cleaning(self):
+        self.add_session()
+        self.workspaces[self.other_socket] = [{"workspace_id": "live", "worktree": self.provenance}]
+        self.assertEqual(plugin.run("observe")["recorded"], 1)
+        self.remove_candidate.assert_not_called()
+
+    def test_check_unused_is_read_only_and_reports_live_use(self):
+        self.observe_checkout()
+        path = self.root / "state" / "worktrees.json"
+        previous = path.read_bytes(), path.stat().st_mtime_ns
+        self.panes[self.socket] = [{"cwd": self.checkout}]
+        result = plugin.run("check-unused")
+        self.assertEqual(result["outcome"], "checked")
+        self.assertEqual(result["results"][0]["outcome"], "kept")
+        self.assertIn("Herdr pane", result["results"][0]["reason"])
+        self.assertEqual(previous, (path.read_bytes(), path.stat().st_mtime_ns))
+        self.remove_candidate.assert_not_called()
+        self.assertFalse(any(command[:2] == ("notification", "show") for _, command in self.calls))
+
+    def test_check_unused_does_not_create_a_registry_from_current_observations(self):
+        self.workspaces[self.socket] = [{"workspace_id": "live", "worktree": self.provenance}]
+        self.assertEqual(len(plugin.run("check-unused")["results"]), 1)
+        self.assertFalse((self.root / "state" / "worktrees.json").exists())
+        self.remove_candidate.assert_not_called()
+
+    def test_clean_unused_removes_only_recorded_worktrees_and_forgets_success(self):
+        self.assertEqual(plugin.run("clean-unused")["results"], [])
+        self.remove_candidate.assert_not_called()
+        self.observe_checkout()
+        result = plugin.run("clean-unused")
+        self.assertEqual(result["results"][0]["outcome"], "removed")
+        self.remove_candidate.assert_called_once()
+        self.assertEqual(plugin.registry(), [])
+
+    def test_partial_cleanup_keeps_provenance_for_a_later_explicit_sweep(self):
+        self.observe_checkout()
+        self.remove_candidate.side_effect = None
+        self.remove_candidate.return_value = dict(self.candidate, outcome="partial", worktree_removed=False,
+                                                   blockers=["untracked: notes.txt", "ignored: .env"])
+        result = plugin.run("clean-unused")["results"][0]
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual(len(plugin.registry()), 1)
+        notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
+        self.assertIn(self.checkout, notices[0][4])
+        self.assertIn("notes.txt", notices[0][4])
+        self.assertIn(".env", notices[0][4])
+
+    def test_sweep_rejects_a_checkout_replaced_since_observation(self):
+        self.observe_checkout()
+        original = Path(self.checkout)
+        original.rename(self.root / "old-checkout")
+        original.mkdir()
+        (original / ".git").write_text("gitdir: replacement\n")
+        result = plugin.run("clean-unused")["results"][0]
+        self.assertEqual(result["outcome"], "kept")
+        self.assertIn("identity changed", result["reason"])
+        self.evaluate.assert_not_called()
+        self.remove_candidate.assert_not_called()
+
+    def test_sweep_keeps_worktree_if_live_usage_becomes_unknown(self):
+        self.observe_checkout()
+        self.panes[self.socket] = [{}]
+        result = plugin.run("clean-unused")["results"][0]
+        self.assertEqual(result["outcome"], "kept")
+        self.assertIn("working directory", result["reason"])
+        self.remove_candidate.assert_not_called()
+
+    def test_notify_mode_applies_to_explicit_sweeps(self):
+        self.observe_checkout()
+        self.configure({"mode": "notify"})
+        result = plugin.run("clean-unused")["results"][0]
+        self.assertEqual(result["outcome"], "eligible")
+        self.assertEqual(result["reason"], "notification-only mode")
+        self.assertEqual(len(plugin.registry()), 1)
+        self.remove_candidate.assert_not_called()
+
+    def test_removed_checkout_notification_can_report_retained_unpushed_branch(self):
+        self.remove_candidate.side_effect = None
+        self.remove_candidate.return_value = dict(self.candidate, outcome="removed", worktree_removed=True,
+                                                   branch_removed=False, branch_reason="unpushed commits")
+        result = plugin.run("event")
+        self.assertEqual(result["outcome"], "removed")
+        notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
+        self.assertEqual(notices[0][2], "Worktree removed; branch retained")
+        self.assertIn("unpushed commits", notices[0][4])
+
+    def test_registry_does_not_lose_concurrent_observations(self):
+        second = self.root / "second"
+        second.mkdir()
+        (second / ".git").write_text("gitdir: second\n")
+        records = [plugin.observed_record(self.checkout, self.repo),
+                   plugin.observed_record(str(second), self.repo)]
+        workers = [threading.Thread(target=lambda record=record: plugin.registry(update=[record]))
+                   for record in records]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len(plugin.registry()), 2)
+
+    def test_registry_forget_does_not_erase_a_newer_identity(self):
+        original = plugin.observed_record(self.checkout, self.repo)
+        replacement = dict(original, identity=[1, 2, 3, 4])
+        plugin.registry(update=[replacement])
+        plugin.registry(forget=original)
+        self.assertEqual(plugin.registry(), [replacement])
+
+    def test_corrupt_registry_fails_closed(self):
+        plugin.registry(update=[])
+        path = self.root / "state" / "worktrees.json"
+        for data in ("{", "[]", '{"version":2,"worktrees":[]}',
+                     '{"version":1,"worktrees":[{"checkout":"/tmp"}]}'):
+            with self.subTest(data=data):
+                path.write_text(data)
+                with self.assertRaises(plugin.Keep):
+                    plugin.run("clean-unused")
+        self.remove_candidate.assert_not_called()
+
+    def test_sweep_sends_one_summary_notification(self):
+        self.observe_checkout()
+        second = self.root / "second"
+        second.mkdir()
+        (second / ".git").write_text("gitdir: second\n")
+        plugin.registry(update=[plugin.observed_record(str(second), self.repo)])
+        result = plugin.run("clean-unused")
+        self.assertEqual(len(result["results"]), 2)
+        self.assertTrue(result["notification_delivered"])
+        notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
+        self.assertEqual(len(notices), 1)
+
+    def test_public_logs_omit_internal_snapshots_and_limit_file_names(self):
+        result = plugin.public_result({"_scan": {"file": "content"}, "outcome": "kept",
+                                       "blockers": ["file-" + str(index) for index in range(100)],
+                                       "results": [{"_private": "value", "outcome": "partial"}]})
+        self.assertNotIn("_scan", result)
+        self.assertNotIn("_private", result["results"][0])
+        self.assertEqual(result["blocker_count"], 100)
+        self.assertEqual(len(result["blockers"]), 40)
 
 
 if __name__ == "__main__":

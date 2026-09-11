@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ class CleanupTests(unittest.TestCase):
         self.remote_tip = None
         self.network_failure = None
         self.calls = []
+        self.patterns = None
         original_run = cleanup._run
 
         def simulated_network(argv, cwd, **kwargs):
@@ -69,7 +71,7 @@ class CleanupTests(unittest.TestCase):
         return self.git("rev-parse", "HEAD", cwd=self.target).strip()
 
     def evaluate(self):
-        return cleanup.evaluate(str(self.target), str(self.root))
+        return cleanup.evaluate(str(self.target), str(self.root), self.patterns)
 
     def remove_then(self, after_worktree_removal):
         candidate = self.evaluate()
@@ -92,7 +94,7 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse((self.root / ".git" / "logs" / "refs" / "heads" / "feature").exists())
 
     def assert_only_worktree_removed(self, result):
-        self.assertEqual(result["outcome"], "failed", result)
+        self.assertEqual(result["outcome"], "removed", result)
         self.assertTrue(result["worktree_removed"])
         self.assertFalse(result["branch_removed"])
         self.assertFalse(self.target.exists())
@@ -104,6 +106,18 @@ class CleanupTests(unittest.TestCase):
             self.assertIn(fragment, result["reason"])
         self.assertTrue(self.target.exists())
         return result
+
+    def assert_branch_retained(self, fragment):
+        candidate = self.evaluate()
+        self.assertTrue(candidate["eligible"], candidate)
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertIn(fragment, result["branch_reason"])
+        return result
+
+    def allow(self, patterns):
+        self.patterns = Path(self.temp.name) / "disposable.gitignore"
+        self.patterns.write_text(patterns)
 
     def test_merged_squashed_deleted_remote_head_is_recoverable(self):
         self.git("merge", "--squash", "feature")
@@ -119,20 +133,20 @@ class CleanupTests(unittest.TestCase):
 
     def test_open_pr_query_blocks_even_outside_historical_limit(self):
         self.open_prs = [{"number": 200}]
-        self.assert_kept("open PR")
+        self.assert_branch_retained("open PR")
 
     def test_open_pr_in_second_query_also_blocks(self):
         self.prs.append({"number": 2, "state": "OPEN"})
-        self.assert_kept("open PR")
+        self.assert_branch_retained("open PR")
 
     def test_no_pr(self):
         self.prs = []
-        self.assert_kept("no closed or merged PR")
+        self.assert_branch_retained("no closed or merged PR")
 
     def test_unpushed_commit(self):
         self.remote_tip = self.tip
         self.commit("unpushed\n")
-        self.assert_kept("not proven pushed")
+        self.assert_branch_retained("not proven pushed")
 
     def test_current_remote_branch_contains_tip(self):
         self.prs[0]["headRefOid"] = self.base
@@ -142,12 +156,12 @@ class CleanupTests(unittest.TestCase):
     def test_stale_remote_tracking_ref_cannot_authorize_removal(self):
         self.git("update-ref", "refs/remotes/origin/feature", self.tip)
         self.prs[0]["headRefOid"] = self.base
-        self.assert_kept("remote branch is absent")
+        self.assert_branch_retained("remote branch is absent")
 
     def test_remote_object_missing_locally_is_kept(self):
         self.prs[0]["headRefOid"] = self.base
         self.remote_tip = "a" * 40
-        self.assert_kept("cat-file failed")
+        self.assert_branch_retained("cat-file failed")
 
     def test_dirty_tracked_staged_and_untracked_are_kept(self):
         with self.subTest("unstaged"):
@@ -187,8 +201,10 @@ class CleanupTests(unittest.TestCase):
 
     def test_detached_main_default_and_primary_are_kept(self):
         with self.subTest("default"):
-            self.default = "feature"
+            self.git("update-ref", "refs/remotes/origin/feature", self.tip)
+            self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature")
             self.assert_kept("default branch")
+            self.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
         self.default = "main"
         with self.subTest("primary"):
             result = cleanup.evaluate(str(self.root), str(self.root))
@@ -290,14 +306,15 @@ class CleanupTests(unittest.TestCase):
 
     def test_non_github_origin_is_kept(self):
         self.git("remote", "set-url", "origin", "git@example.invalid:example/project.git")
-        self.assert_kept("GitHub")
+        self.assert_branch_retained("GitHub")
 
     def test_api_and_required_remote_errors_fail_closed(self):
         self.network_failure = "gh"
-        self.assert_kept("GitHub unavailable")
+        self.assert_branch_retained("GitHub unavailable")
+        self.git("worktree", "add", str(self.target), "feature")
         self.network_failure = "remote"
         self.prs[0]["headRefOid"] = self.base
-        self.assert_kept("remote unavailable")
+        self.assert_branch_retained("remote unavailable")
 
     def test_removal_revalidates_and_removes_only_local_branch(self):
         self.git("update-ref", "refs/remotes/origin/feature", self.tip)
@@ -310,7 +327,8 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(any("--force" in call or "prune" in call or "fetch" in call for call in self.calls))
         self.assertFalse(any(call[:2] == ["git", "push"] for call in self.calls))
 
-    def test_removal_includes_ignored_nested_virtualenvs_and_node_modules(self):
+    def test_removal_includes_approved_ignored_nested_virtualenvs_and_node_modules(self):
+        self.allow("**/.venv/\n**/node_modules/\n")
         (self.root / ".git" / "info" / "exclude").write_text("**/.venv/\n**/node_modules/\n")
         for relative in ("services/api/.venv/lib/python/site-packages/pkg/data",
                          "services/worker/.venv/bin/python",
@@ -424,7 +442,7 @@ class CleanupTests(unittest.TestCase):
         newer = self.git("commit-tree", self.base + "^{tree}", "-p", self.tip, "-m", "new commit").strip()
         result = self.remove_then(lambda: self.git("update-ref", "refs/heads/feature", newer))
         self.assert_only_worktree_removed(result)
-        self.assertIn("branch tip changed", result["reason"])
+        self.assertIn("branch tip changed", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "feature").strip(), newer)
 
     def test_atomic_branch_deletion_preserves_tip_changed_after_checks(self):
@@ -440,14 +458,14 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup.subprocess, "run", side_effect=change_before_delete):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("git update-ref failed", result["reason"])
+        self.assertIn("git update-ref failed", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "feature").strip(), newer)
 
     def test_branch_checked_out_elsewhere_during_removal_is_retained(self):
         other = Path(self.temp.name) / "reused"
         result = self.remove_then(lambda: self.git("worktree", "add", str(other), "feature"))
         self.assert_only_worktree_removed(result)
-        self.assertIn("checked out in another worktree", result["reason"])
+        self.assertIn("checked out in another worktree", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=other).strip(), self.tip)
 
     def test_detached_rebase_and_bisect_keep_branch(self):
@@ -464,7 +482,7 @@ class CleanupTests(unittest.TestCase):
                     (marker / "head-name").write_text("refs/heads/feature\n")
                 result = cleanup.remove_candidate(self.evaluate(), lambda: True)
                 self.assert_only_worktree_removed(result)
-                self.assertIn("active rebase or bisect", result["reason"])
+                self.assertIn("active rebase or bisect", result["branch_reason"])
                 self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
                 if marker.is_dir():
                     shutil.rmtree(marker)
@@ -486,7 +504,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup.os, "listdir", side_effect=deny_metadata):
             result = cleanup.remove_candidate(self.evaluate(), lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("worktree metadata could not be read", result["reason"])
+        self.assertIn("worktree metadata could not be read", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
 
     def test_unreadable_head_or_gitdir_keeps_branch(self):
@@ -503,7 +521,7 @@ class CleanupTests(unittest.TestCase):
                 with patch.object(Path, "read_text", autospec=True, side_effect=deny_file):
                     result = cleanup.remove_candidate(self.evaluate(), lambda: True)
                 self.assert_only_worktree_removed(result)
-                self.assertIn("worktree metadata could not be read", result["reason"])
+                self.assertIn("worktree metadata could not be read", result["branch_reason"])
                 self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
                 self.git("worktree", "add", str(self.target), "feature")
 
@@ -520,7 +538,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup, "_worktrees", side_effect=incomplete_after_removal):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("no verifiable branch state", result["reason"])
+        self.assertIn("no verifiable branch state", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
 
     def test_metadata_head_protects_branch_if_worktree_list_omits_it(self):
@@ -536,7 +554,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup, "_worktrees", side_effect=omit_other):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("checked out in another worktree", result["reason"])
+        self.assertIn("checked out in another worktree", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=other).strip(), self.tip)
 
     def test_post_removal_policy_changes_keep_branch(self):
@@ -551,7 +569,7 @@ class CleanupTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 result = self.remove_then(change)
                 self.assert_only_worktree_removed(result)
-                self.assertIn(reason, result["reason"])
+                self.assertIn(reason, result["branch_reason"])
                 self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
                 self.open_prs = []
                 self.default = "main"
@@ -571,7 +589,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup.subprocess, "run", side_effect=fail_branch_delete):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("cannot lock ref", result["reason"])
+        self.assertIn("cannot lock ref", result["branch_reason"])
         self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
         self.assertTrue((self.root / ".git" / "logs" / "refs" / "heads" / "feature").is_file())
 
@@ -587,7 +605,7 @@ class CleanupTests(unittest.TestCase):
         with patch.object(cleanup.subprocess, "run", side_effect=leave_branch):
             result = cleanup.remove_candidate(candidate, lambda: True)
         self.assert_only_worktree_removed(result)
-        self.assertIn("still exists after deletion", result["reason"])
+        self.assertIn("still exists after deletion", result["branch_reason"])
 
     def test_moved_head_is_kept_even_if_new_tip_is_also_recoverable(self):
         candidate = self.evaluate()
@@ -647,12 +665,311 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertIn("BatchMode=yes", env["GIT_SSH_COMMAND"])
 
-    def test_new_open_pr_at_removal_keeps_target(self):
+    def test_new_open_pr_at_removal_keeps_branch_only(self):
         candidate = self.evaluate()
         self.open_prs = [{"number": 2}]
         result = cleanup.remove_candidate(candidate, lambda: True)
-        self.assertEqual(result["outcome"], "kept")
-        self.assertTrue(self.target.exists())
+        self.assert_only_worktree_removed(result)
+        self.assertIn("open PR", result["branch_reason"])
+
+    def ignored_file(self, relative, contents="junk\n"):
+        path = self.target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+        return path
+
+    def ignore(self, patterns):
+        (self.root / ".git" / "info" / "exclude").write_text(patterns)
+
+    def test_evaluate_never_queries_network(self):
+        self.network_failure = "gh"
+        self.assertTrue(self.evaluate()["eligible"])
+        self.assertFalse(any(call[0] == "gh" or call[:2] == ["git", "ls-remote"] for call in self.calls))
+
+    def test_untouched_branch_without_pr_is_removed_and_recoverable(self):
+        self.git("reset", "--hard", self.base, cwd=self.target)
+        self.prs = []
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_only_worktree_removed(result)
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.base)
+        self.git("worktree", "add", str(self.target), "feature")
+        self.assertEqual((self.target / "file.txt").read_text(), "base\n")
+
+    def test_ignored_files_are_protected_without_patterns(self):
+        self.ignore(".env\nnode_modules/\n")
+        self.ignored_file(".env", "private data\n")
+        self.ignored_file("node_modules/pkg/index.js")
+        candidate = self.assert_kept("protected file")
+        self.assertIn("protected file: .env", candidate["blockers"])
+
+    def test_partial_cleanup_preserves_ignored_secrets_and_uncommitted_work(self):
+        self.ignore(".env\nnode_modules/\n")
+        self.allow("node_modules/\n")
+        self.ignored_file(".env", "private data\n")
+        self.ignored_file("node_modules/pkg/index.js")
+        (self.target / "file.txt").write_text("local changes\n")
+        self.ignored_file("notes.txt", "new notes\n")
+        candidate = self.evaluate()
+        self.assertEqual(candidate["cleanup_kind"], "partial", candidate)
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "partial", result)
+        self.assertFalse(result["worktree_removed"])
+        self.assertEqual((self.target / ".env").read_text(), "private data\n")
+        self.assertEqual((self.target / "file.txt").read_text(), "local changes\n")
+        self.assertEqual((self.target / "notes.txt").read_text(), "new notes\n")
+        self.assertFalse((self.target / "node_modules").exists())
+        self.assertEqual(self.git("rev-parse", "feature").strip(), self.tip)
+        self.assertFalse(any(call[0] == "gh" for call in self.calls))
+
+    def test_disposable_patterns_never_override_tracked_or_nonignored_files(self):
+        self.ignore("cache/\n")
+        self.allow("*\n")
+        self.ignored_file("cache/dependency")
+        self.ignored_file("notes.txt", "valuable\n")
+        (self.target / "file.txt").write_text("staged work\n")
+        self.git("add", "file.txt", cwd=self.target)
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assertEqual(result["outcome"], "partial", result)
+        self.assertEqual((self.target / "file.txt").read_text(), "staged work\n")
+        self.assertEqual((self.target / "notes.txt").read_text(), "valuable\n")
+        self.assertIn("staged work", self.git("show", ":file.txt", cwd=self.target))
+
+    def test_exception_inside_approved_directory_preserves_file_and_worktree(self):
+        self.ignore("node_modules/\n")
+        self.allow("node_modules/\n!node_modules/keep.txt\n")
+        self.ignored_file("node_modules/keep.txt", "valuable\n")
+        self.ignored_file("node_modules/pkg/junk")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assertEqual(result["outcome"], "partial", result)
+        self.assertEqual((self.target / "node_modules/keep.txt").read_text(), "valuable\n")
+        self.assertFalse((self.target / "node_modules/pkg").exists())
+
+    def test_ignored_symlinks_removed_without_touching_targets(self):
+        self.ignore("links/\n")
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        (outside / "precious").write_text("data\n")
+        (self.target / "links").mkdir()
+        (self.target / "links/external").symlink_to(outside, target_is_directory=True)
+        (self.target / "links/missing").symlink_to(outside / "missing")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_branch_removed(result)
+        self.assertEqual((outside / "precious").read_text(), "data\n")
+
+    def test_nonignored_symlink_is_protected(self):
+        (self.target / "notes-link").symlink_to("missing")
+        self.assert_kept("changes")
+
+    def test_exception_protects_ignored_symlink(self):
+        self.ignore("links/\n")
+        self.allow("links/\n!links/keep\n")
+        (self.target / "links").mkdir()
+        (self.target / "links/keep").symlink_to("missing")
+        self.assert_kept("protected file: links/keep")
+        self.assertTrue((self.target / "links/keep").is_symlink())
+
+    def test_hardlink_with_external_copy_allows_full_cleanup(self):
+        self.ignore("linked\n")
+        outside = Path(self.temp.name) / "outside"
+        outside.write_text("only copy outside checkout\n")
+        os.link(outside, self.target / "linked")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_branch_removed(result)
+        self.assertEqual(outside.read_text(), "only copy outside checkout\n")
+        self.assertEqual(outside.stat().st_nlink, 1)
+
+    def test_all_hardlinks_inside_checkout_are_protected(self):
+        self.ignore("links/\n")
+        first = self.ignored_file("links/first", "valuable\n")
+        os.link(first, self.target / "links/second")
+        self.assert_kept("protected file")
+        self.assertEqual(first.stat().st_nlink, 2)
+
+    def test_hardlinks_can_survive_partial_cleanup_inside_checkout(self):
+        self.ignore("links/\n")
+        first = self.ignored_file("links/first", "valuable\n")
+        os.link(first, self.target / "notes.txt")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assertEqual(result["outcome"], "partial", result)
+        self.assertFalse(first.exists())
+        self.assertEqual((self.target / "notes.txt").read_text(), "valuable\n")
+
+    def test_hardlinks_approved_explicitly_need_no_surviving_copy(self):
+        self.ignore("links/\n")
+        self.allow("links/\n")
+        first = self.ignored_file("links/first")
+        os.link(first, self.target / "links/second")
+        result = cleanup.remove_candidate(self.evaluate(), lambda: True)
+        self.assert_branch_removed(result)
+        self.assertEqual(result["disposed_files"], 2)
+
+    def test_hardlink_exception_is_protected_despite_external_copy(self):
+        self.ignore("linked\n")
+        self.allow("!linked\n")
+        outside = Path(self.temp.name) / "outside"
+        outside.write_text("valuable\n")
+        os.link(outside, self.target / "linked")
+        self.assert_kept("protected file: linked")
+
+    def test_lost_external_hardlink_during_disposal_guard_blocks_unlink(self):
+        self.ignore("linked\n")
+        outside = Path(self.temp.name) / "outside"
+        outside.write_text("valuable\n")
+        os.link(outside, self.target / "linked")
+        calls = [0]
+        def lose_copy():
+            calls[0] += 1
+            if calls[0] == 2:
+                outside.unlink()
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), lose_copy)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertIn("surviving copy", result["reason"])
+        self.assertEqual((self.target / "linked").read_text(), "valuable\n")
+
+    def test_active_git_operations_block_even_partial_cleanup(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency")
+        metadata = Path(self.git("rev-parse", "--absolute-git-dir", cwd=self.target).strip())
+        for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_START", "index.lock"):
+            with self.subTest(name=name):
+                marker = metadata / name
+                marker.write_text(self.tip + "\n")
+                self.assert_kept("active Git operation")
+                self.assertTrue(junk.exists())
+                marker.unlink()
+
+    def test_pattern_changes_after_evaluation_block_cleanup(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency")
+        candidate = self.evaluate()
+        self.patterns.write_text("!cache/\n")
+        result = cleanup.remove_candidate(candidate, lambda: True)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertTrue(junk.exists())
+
+    def test_pattern_changes_during_usage_check_block_cleanup(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency")
+        def protect():
+            self.patterns.write_text("!cache/\n")
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), protect)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertIn("pattern file changed", result["reason"])
+        self.assertTrue(junk.exists())
+
+    def test_ignored_data_created_during_usage_callback_is_preserved(self):
+        self.ignore(".env\n")
+        def create_secret():
+            self.ignored_file(".env", "late data\n")
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), create_secret)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertEqual((self.target / ".env").read_text(), "late data\n")
+
+    def test_file_changed_during_disposal_guard_is_preserved(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency")
+        calls = [0]
+        def edit():
+            calls[0] += 1
+            if calls[0] == 2:
+                junk.write_text("new valuable contents\n")
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), edit)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertIn("file changed", result["reason"])
+        self.assertEqual(junk.read_text(), "new valuable contents\n")
+
+    def test_files_reclassified_during_disposal_guard_are_preserved(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency", "valuable\n")
+        for change in (lambda: self.ignore(""),
+                       lambda: self.git("add", "-f", "cache/dependency", cwd=self.target)):
+            with self.subTest(change=change):
+                calls = [0]
+                def reclassify():
+                    calls[0] += 1
+                    if calls[0] == 2:
+                        change()
+                    return True
+                result = cleanup.remove_candidate(self.evaluate(), reclassify)
+                self.assertEqual(result["outcome"], "kept", result)
+                self.assertIn("became tracked, non-ignored", result["reason"])
+                self.assertEqual(junk.read_text(), "valuable\n")
+                self.ignore("cache/\n")
+
+    def test_directory_swap_to_symlink_during_usage_is_preserved(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        self.ignored_file("cache/dependency")
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        (outside / "dependency").write_text("valuable\n")
+        def swap():
+            (self.target / "cache").rename(self.target / "old-cache")
+            (self.target / "cache").symlink_to(outside, target_is_directory=True)
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), swap)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertEqual((outside / "dependency").read_text(), "valuable\n")
+
+    def test_unreadable_or_invalid_disposal_policy_keeps_checkout(self):
+        self.allow("cache/\n")
+        self.patterns.write_bytes(b"\xff")
+        self.assert_kept("UTF-8")
+        self.patterns.unlink()
+        self.patterns.symlink_to("absent-patterns")
+        self.assert_kept("broken symlink")
+
+    def test_approved_nested_repository_blocks_partial_cleanup(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        junk = self.ignored_file("cache/dependency")
+        nested = self.target / "cache/repo"
+        nested.mkdir()
+        self.git("init", cwd=nested)
+        self.assert_kept("nested Git repository")
+        self.assertTrue(junk.exists())
+
+    def test_approved_fifo_is_protected(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        (self.target / "cache").mkdir()
+        os.mkfifo(self.target / "cache/pipe")
+        self.assert_kept("protected file: cache/pipe")
+
+
+    def test_directory_moved_outside_checkout_during_disposal_is_preserved(self):
+        self.ignore("cache/\n")
+        self.allow("cache/\n")
+        self.ignored_file("cache/dependency", "original data\n")
+        saved = Path(self.temp.name) / "saved-outside-checkout"
+        calls = [0]
+        def move():
+            calls[0] += 1
+            if calls[0] == 2:
+                (self.target / "cache").rename(saved)
+                self.ignored_file("cache/dependency", "replacement data\n")
+            return True
+        result = cleanup.remove_candidate(self.evaluate(), move)
+        self.assertEqual(result["outcome"], "kept", result)
+        self.assertIn("directory moved or changed", result["reason"])
+        self.assertEqual((saved / "dependency").read_text(), "original data\n")
+        self.assertEqual((self.target / "cache/dependency").read_text(), "replacement data\n")
+
+    def test_changed_filename_is_reported_including_newlines(self):
+        (self.target / "file.txt").write_text("changed\n")
+        (self.target / "notes\nfile").write_text("new notes\n")
+        candidate = self.evaluate()
+        self.assertIn("changed file: file.txt", candidate["blockers"])
+        self.assertIn("changed file: notes\nfile", candidate["blockers"])
 
 
 if __name__ == "__main__":

@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from git_cleanup import evaluate, remove_candidate
@@ -75,8 +77,8 @@ class Herdr:
                 raise Keep("space remains open")
             time.sleep(0.1)
 
-    def unused(self, checkout, closed_workspace_id):
-        """Check every discoverable local server, including ordinary pane cwds."""
+    def sockets(self):
+        """Include nonresponding sockets so uncertain live state fails closed."""
         sessions = self.call("session", "list", "--json", raw=True).get("sessions")
         if not isinstance(sessions, list):
             raise Keep("invalid Herdr session list")
@@ -90,9 +92,28 @@ class Herdr:
             # A socket that exists but does not answer is uncertain, not unused.
             if session.get("running") or os.path.lexists(socket):
                 sockets.add(socket)
-        for socket in sorted(sockets):
+        return sorted(sockets)
+
+    def observed(self):
+        records = []
+        for socket in self.sockets():
             for workspace in self.workspaces(socket):
-                if socket == self.socket and workspace.get("workspace_id") == closed_workspace_id:
+                provenance = workspace.get("worktree")
+                if provenance is None:
+                    continue
+                if not isinstance(provenance, dict):
+                    raise Keep("invalid Herdr worktree metadata")
+                if provenance.get("is_linked_worktree") is True:
+                    checkout, repo = provenance_paths(provenance)
+                    records.append(observed_record(checkout, repo))
+        return records
+
+    def unused(self, checkout, closed_workspace_id=None):
+        """Check every discoverable local server, including ordinary pane cwds."""
+        for socket in self.sockets():
+            for workspace in self.workspaces(socket):
+                if (closed_workspace_id is not None and socket == self.socket
+                        and workspace.get("workspace_id") == closed_workspace_id):
                     raise Keep("space was reopened")
                 provenance = workspace.get("worktree") or {}
                 if not isinstance(provenance, dict):
@@ -127,6 +148,12 @@ def inside(value, checkout):
     return os.path.commonpath([path, checkout]) == checkout
 
 
+def provenance_paths(provenance):
+    if not isinstance(provenance, dict) or provenance.get("is_linked_worktree") is not True:
+        raise Keep("space has no recorded linked worktree")
+    return absolute_path(provenance.get("checkout_path")), absolute_path(provenance.get("repo_root"))
+
+
 def invocation(action):
     context = object_json(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
     if action == "check":
@@ -153,10 +180,7 @@ def invocation(action):
             provenance = context.get("worktree")
     if not isinstance(workspace_id, str) or not workspace_id:
         raise Keep("space identifier is missing")
-    if not isinstance(provenance, dict) or provenance.get("is_linked_worktree") is not True:
-        raise Keep("space has no recorded linked worktree")
-    checkout = absolute_path(provenance.get("checkout_path"))
-    repo = absolute_path(provenance.get("repo_root"))
+    checkout, repo = provenance_paths(provenance)
     return workspace_id, checkout, repo
 
 
@@ -177,74 +201,238 @@ def configured_mode():
     return mode
 
 
+def patterns_path():
+    return str(Path(absolute_path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))) / "disposable.gitignore")
+
+
+def observed_record(checkout, repo):
+    """Record identity as well as provenance; a reused path needs observing again."""
+    directory, marker = os.lstat(checkout), os.lstat(os.path.join(checkout, ".git"))
+    if not stat.S_ISDIR(directory.st_mode) or not stat.S_ISREG(marker.st_mode):
+        raise Keep("observed checkout is not a linked worktree directory")
+    return {"checkout": checkout, "repo": repo,
+            "identity": [directory.st_dev, directory.st_ino, marker.st_dev, marker.st_ino]}
+
+
 @contextmanager
-def repository_lock(repo):
+def state_lock(name):
     directory = Path(absolute_path(os.environ.get("HERDR_PLUGIN_STATE_DIR"))) / "locks"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = directory / (hashlib.sha256(os.fsencode(repo)).hexdigest() + ".lock")
-    descriptor = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(str(directory / name), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        # Queue cleanup until the prior removal finishes, then recheck eligibility.
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
         os.close(descriptor)
 
 
-def run(action):
-    workspace_id, checkout, repo = invocation(action)
+def registry(update=None, forget=None):
+    """Atomically merge trusted observations without losing concurrent hook updates."""
+    path = Path(absolute_path(os.environ.get("HERDR_PLUGIN_STATE_DIR"))) / "worktrees.json"
+    with state_lock("registry.lock"):
+        try:
+            data = object_json(path.read_text())
+        except FileNotFoundError:
+            data = {"version": 1, "worktrees": []}
+        except (OSError, ValueError) as error:
+            raise Keep("cannot read worktree provenance registry") from error
+        if data.get("version") != 1 or not isinstance(data.get("worktrees"), list):
+            raise Keep("invalid worktree provenance registry")
+        records = {}
+        for record in data["worktrees"]:
+            if (not isinstance(record, dict) or set(record) != {"checkout", "repo", "identity"}
+                    or not isinstance(record["identity"], list) or len(record["identity"]) != 4
+                    or not all(type(value) is int and value >= 0 for value in record["identity"])):
+                raise Keep("invalid worktree provenance record")
+            checkout, repo = absolute_path(record["checkout"]), absolute_path(record["repo"])
+            if checkout != record["checkout"] or repo != record["repo"] or checkout in records:
+                raise Keep("ambiguous worktree provenance record")
+            records[checkout] = record
+        for record in update or []:
+            records[record["checkout"]] = record
+        if forget and records.get(forget["checkout"]) == forget:
+            records.pop(forget["checkout"])
+        result = sorted(records.values(), key=lambda record: record["checkout"])
+        if update is not None or forget is not None:
+            descriptor, temporary = tempfile.mkstemp(prefix=".worktrees-", dir=str(path.parent))
+            try:
+                with os.fdopen(descriptor, "w") as output:
+                    json.dump({"version": 1, "worktrees": result}, output, sort_keys=True)
+                    output.write("\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        return result
+
+
+@contextmanager
+def repository_lock(repo):
+    with state_lock(hashlib.sha256(os.fsencode(repo)).hexdigest() + ".lock"):
+        # Queue cleanup until the prior removal finishes, then recheck eligibility.
+        yield
+
+
+def describe(result):
+    lines = [result.get("path", result.get("checkout", "")), result.get("reason", "")]
+    blockers = result.get("blockers") or []
+    lines.extend(str(item) for item in blockers[:8])
+    if len(blockers) > 8:
+        lines.append("{} more blockers; inspect the plugin log".format(len(blockers) - 8))
+    if result.get("branch_reason"):
+        lines.append("Local branch retained: " + result["branch_reason"])
+    return "\n".join(line for line in lines if line)
+
+
+def notify_result(herdr, result):
+    outcome = result.get("outcome")
+    if outcome == "removed":
+        if result.get("branch_removed"):
+            title = "Worktree and branch removed"
+            body = result["path"] + "\nLocal branch: " + result["branch"]
+        else:
+            title, body = "Worktree removed; branch retained", describe(result)
+    elif outcome == "failed":
+        if result.get("worktree_removed"):
+            title = "Branch cleanup failed"
+            body = (result["path"] + "\nWorktree removed; local branch cleanup incomplete: "
+                    + result.get("branch", "unknown") + "\n" + result["reason"])
+        else:
+            title = "Worktree cleanup failed"
+            body = describe(result) + "\nThe checkout may be partially removed; inspect the plugin log."
+    elif outcome == "partial":
+        title, body = "Worktree junk removed; files retained", describe(result)
+    elif outcome == "eligible":
+        title, body = "Worktree ready for cleanup", describe(result)
+    else:
+        title, body = "Worktree retained", describe(result)
+    result["notification_delivered"] = herdr.notify(title, body)
+    return result
+
+
+def notify_sweep(herdr, results):
+    counts = {}
+    for result in results:
+        outcome = result["outcome"]
+        counts[outcome] = counts.get(outcome, 0) + 1
+    body = ", ".join("{} {}".format(counts[outcome], outcome) for outcome in sorted(counts))
+    # Keep one explicit sweep to one toast; complete decisions remain in its log.
+    for result in results[:4]:
+        body += "\n\n" + describe(result)
+    if len(results) > 4:
+        body += "\n\n{} more worktrees; inspect the plugin log".format(len(results) - 4)
+    return herdr.notify("Unused worktree cleanup", body or "No recorded worktrees to clean")
+
+
+def cleanup(herdr, record, *, dry_run=False, workspace_id=None, active_check=False):
+    checkout, repo = record["checkout"], record["repo"]
     mode = configured_mode()
-    herdr = Herdr()
-    if action == "event":
-        herdr.wait_closed(workspace_id)
+    if observed_record(checkout, repo) != record:
+        raise Keep("worktree identity changed since Herdr observed it; reopen it to register its current identity")
+    if not active_check:
         herdr.unused(checkout, workspace_id)
-    candidate = evaluate(checkout, repo)
+    candidate = evaluate(checkout, repo, patterns_path=patterns_path())
+    candidate = dict(candidate, path=checkout, repo_root=repo)
     if not candidate.get("eligible"):
         return dict(candidate, outcome="kept")
-    if action == "check":
-        return dict(candidate, outcome="eligible", reason="Git/PR checks pass; close the space to check usage and remove the worktree and local branch")
-    # The common Git directory is shared even when provenance names a linked
-    # checkout as the repository root. Removal re-evaluates inside this lock.
+    if dry_run:
+        reason = "filesystem checks pass; cleanup would " + (
+            "remove the checkout and check whether its branch may be deleted"
+            if candidate.get("remove_worktree", True) else "remove only disposable ignored files")
+        if active_check:
+            reason += "; live usage is checked when the space closes"
+        return dict(candidate, outcome="eligible", reason=reason)
+    # Linked roots can name the same repository: use the common Git directory.
     with repository_lock(absolute_path(candidate.get("common_dir"))):
+        if observed_record(checkout, repo) != record:
+            raise Keep("worktree identity changed before cleanup")
         if mode == "notify":
             herdr.unused(checkout, workspace_id)
-            delivered = herdr.notify("Worktree ready for cleanup", checkout)
-            return dict(candidate, outcome="eligible", reason="notification-only mode",
-                        notification_delivered=delivered)
+            return dict(candidate, outcome="eligible", reason="notification-only mode")
+
         def still_unused():
             if configured_mode() != "auto":
                 raise Keep("automatic removal was disabled during the check")
+            if observed_record(checkout, repo) != record:
+                raise Keep("worktree identity changed before cleanup")
             return herdr.unused(checkout, workspace_id)
 
-        result = remove_candidate(candidate, still_unused)
-        if result.get("outcome") == "removed":
-            result["notification_delivered"] = herdr.notify(
-                "Worktree and branch removed", checkout + "\nLocal branch: " + result["branch"],
-            )
-        elif result.get("outcome") == "failed":
-            if result.get("worktree_removed"):
-                result["notification_delivered"] = herdr.notify(
-                    "Branch cleanup failed",
-                    checkout + "\nWorktree removed; local branch cleanup incomplete: "
-                    + result["branch"] + "\n" + result["reason"],
-                )
-            else:
-                result["notification_delivered"] = herdr.notify(
-                    "Worktree cleanup failed",
-                    checkout + "\n" + result["reason"] + "\nThe checkout may be partially removed; inspect the plugin log.",
-                )
+        return remove_candidate(candidate, still_unused)
+
+
+def run(action):
+    if action in {"observe", "clean-unused", "check-unused"}:
+        herdr = Herdr()
+        observations = herdr.observed()
+        if action == "observe":
+            registry(update=observations)
+            return {"outcome": "observed", "recorded": len(observations),
+                    "reason": "recorded live Herdr worktree provenance; no cleanup performed"}
+        dry_run = action == "check-unused"
+        records = registry() if dry_run else registry(update=observations)
+        if dry_run:
+            combined = {record["checkout"]: record for record in records}
+            combined.update({record["checkout"]: record for record in observations})
+            records = sorted(combined.values(), key=lambda record: record["checkout"])
+        results = []
+        for record in records:
+            try:
+                result = cleanup(herdr, record, dry_run=dry_run)
+            except (Keep, OSError, ValueError) as error:
+                result = {"outcome": "kept", "path": record["checkout"], "reason": str(error)}
+            if not dry_run:
+                if result.get("worktree_removed"):
+                    registry(forget=record)
+            results.append(result)
+        response = {"outcome": "failed" if any(r["outcome"] == "failed" for r in results)
+                    else "checked" if dry_run else "cleaned", "results": results}
+        if not dry_run:
+            response["notification_delivered"] = notify_sweep(herdr, results)
+        return response
+
+    workspace_id, checkout, repo = invocation(action)
+    record = observed_record(checkout, repo)
+    if action == "check":
+        return cleanup(Herdr(), record, dry_run=True, active_check=True)
+    registry(update=[record])
+    herdr = Herdr()
+    # A non-last pane exit is ordinary activity, not a skipped cleanup warning.
+    herdr.wait_closed(workspace_id)
+    try:
+        result = cleanup(herdr, record, workspace_id=workspace_id)
+    except (Keep, OSError, ValueError) as error:
+        result = {"outcome": "kept", "path": checkout, "reason": str(error)}
+    if result.get("worktree_removed"):
+        registry(forget=record)
+    return notify_result(herdr, result)
+
+
+def public_result(value):
+    """Keep filesystem snapshots private and bound file-name output in logs."""
+    if isinstance(value, dict):
+        result = {key: public_result(item) for key, item in value.items()
+                  if not key.startswith("_") and key != "blockers"}
+        if "blockers" in value:
+            blockers = value["blockers"]
+            result["blocker_count"] = len(blockers)
+            result["blockers"] = public_result(blockers[:40])
         return result
+    if isinstance(value, list):
+        return [public_result(item) for item in value]
+    return value
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["event", "check"])
+    parser.add_argument("action", choices=["event", "check", "observe", "clean-unused", "check-unused"])
     action = parser.parse_args().action
     try:
         result = run(action)
     except (Keep, OSError, ValueError) as error:
         result = {"outcome": "kept", "reason": str(error)}
-    print(json.dumps(result, sort_keys=True))
+    print(json.dumps(public_result(result), sort_keys=True))
     return 1 if result.get("outcome") == "failed" else 0
 
 

@@ -109,6 +109,18 @@ class Server:
         self.run("tab", "close", workspace["active_tab_id"])
         self.settled(previous)
 
+    def action(self, action):
+        previous = {log["log_id"] for log in self.logs()}
+        self.run("plugin", "action", "invoke", PLUGIN_ID + "." + action)
+
+        def complete():
+            logs = [log for log in self.logs() if log["log_id"] not in previous]
+            if any(log["status"] == "failed" for log in logs):
+                raise AssertionError("Plugin action failed: " + json.dumps(logs, indent=2))
+            results = [json.loads(log["stdout"]) for log in logs if log.get("stdout")]
+            return next((result for result in results if result.get("outcome") in {"checked", "cleaned"}), False)
+        return wait_for(action + " action completion", complete)
+
     def diagnostic(self):
         print("Private server diagnostics ({})".format(self.socket), file=sys.stderr)
         print(self.log_path.read_text()[-10000:], file=sys.stderr)
@@ -258,6 +270,9 @@ def smoke(root, herdr, plugin_dir, servers):
     servers.append(first)
     first.ready()
     first.run("plugin", "link", str(plugin_dir), "--enabled")
+    config_dir = root / "config" / "herdr" / "plugins" / "config" / PLUGIN_ID
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "disposable.gitignore").write_text(".venv/\nnode_modules/\n")
 
     path = fixtures.worktree("last-tab")
     (fixtures.repo / ".git" / "info" / "exclude").write_text(".venv/\nnode_modules/\n")
@@ -303,11 +318,35 @@ def smoke(root, herdr, plugin_dir, servers):
         if dirty:
             (path / "untracked.txt").write_text("Preserve this work\n")
         first.close_last_tab(first.open_worktree(fixtures.repo, path))
-        assert path.is_dir(), "Unsafe cleanup of " + branch
         assert fixtures.run("rev-parse", "--verify", "refs/heads/" + branch)
         if dirty:
+            assert path.is_dir(), "Unsafe cleanup of " + branch
             assert (path / "untracked.txt").read_text() == "Preserve this work\n"
-        print("PASS: {} worktree is retained".format(branch))
+        else:
+            assert not path.exists(), "Retained clean checkout for " + branch
+        print("PASS: {} retains local work and cleans an eligible checkout".format(branch))
+
+    path = fixtures.worktree("no-pr")
+    fixtures.prs.pop("no-pr")
+    fixtures.write_prs()
+    first.close_last_tab(first.open_worktree(fixtures.repo, path))
+    assert not path.exists(), "No-PR checkout was retained"
+    assert fixtures.run("rev-parse", "--verify", "refs/heads/no-pr")
+    print("PASS: no-PR worktree is removed with local branch retained")
+
+    path = fixtures.worktree("partial")
+    (fixtures.repo / ".git" / "info" / "exclude").write_text(".venv/\nnode_modules/\n.env\n")
+    (path / ".env").write_text("PRESERVE=local-value\n")
+    (path / "tracked.txt").write_text("uncommitted work\n")
+    dependencies = path / "node_modules"
+    dependencies.mkdir()
+    (dependencies / "cache.js").write_text("reinstallable\n")
+    first.close_last_tab(first.open_worktree(fixtures.repo, path))
+    assert path.is_dir()
+    assert not dependencies.exists(), "Partial cleanup retained approved dependencies"
+    assert (path / "tracked.txt").read_text() == "uncommitted work\n"
+    assert (path / ".env").read_text() == "PRESERVE=local-value\n"
+    print("PASS: partial cleanup removes dependencies and preserves edits and unapproved ignored .env")
 
     mode_path = root / "config" / "herdr" / "plugins" / "config" / PLUGIN_ID / "config.json"
     mode_path.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +356,15 @@ def smoke(root, herdr, plugin_dir, servers):
     assert path.is_dir(), "Notify-only mode removed checkout"
     print("PASS: notify-only mode retains eligible checkout")
     mode_path.write_text(json.dumps({"mode": "auto"}))
+    preview = first.action("check-unused")
+    assert any(result["path"] == str(path) and result["outcome"] == "eligible"
+               for result in preview["results"])
+    assert path.exists(), "Preview removed an eligible checkout"
+    swept = first.action("clean-unused")
+    assert any(result["path"] == str(path) and result["outcome"] == "removed"
+               for result in swept["results"])
+    fixtures.assert_removed(path, "notify")
+    print("PASS: dry-run sweep preserves worktrees and explicit sweep cleans previously recorded unused checkout")
 
     path = fixtures.worktree("shared-pane")
     subdir = path / "subdir"

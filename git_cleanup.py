@@ -8,6 +8,8 @@ import subprocess
 from typing import Callable
 from urllib.parse import urlparse
 
+import disposable
+
 
 class CheckError(Exception):
     """An eligibility check could not safely complete."""
@@ -69,23 +71,6 @@ def _worktrees(repo_root):
     return records
 
 
-def _nested_repository(path):
-    scanned = 0
-    for directory, dirs, files in os.walk(path, followlinks=False,
-                                         onerror=lambda error: (_ for _ in ()).throw(error)):
-        scanned += 1
-        if scanned > 100000:
-            raise CheckError("nested repository check exceeded its directory limit")
-        if directory != path and (".git" in dirs or ".git" in files):
-            return True
-        if ("HEAD" in files and "objects" in dirs
-                and ("refs" in dirs or "packed-refs" in files)):
-            return True
-        if ".git" in dirs:
-            dirs.remove(".git")
-    return False
-
-
 def _require_visible_index(path):
     # These flags hide working-file edits from both status and worktree remove.
     # Preserve the entire checkout, including sparse checkouts, if either is set.
@@ -120,21 +105,26 @@ def _inspect(checkout, repo_root):
         other_path = os.path.realpath(other.get("worktree", ""))
         if other_path.startswith(path + os.sep):
             raise CheckError("target contains another registered worktree")
-    if _nested_repository(path):
-        raise CheckError("target contains a nested Git repository")
     if "detached" in record or not record.get("branch", "").startswith("refs/heads/"):
-        raise CheckError("detached worktree has no branch PR policy")
+        raise CheckError("detached worktree has no branch retaining its commits")
     branch = _git(["symbolic-ref", "--quiet", "--short", "HEAD"], path).strip()
     if record["branch"] != "refs/heads/" + branch:
         raise CheckError("worktree branch changed during inspection")
     if branch in ("main", "master"):
         raise CheckError("protected branch: " + branch)
+    defaults = _git(["for-each-ref", "--format=%(symref)",
+                     "refs/remotes/origin/HEAD"], root).splitlines()
+    if "refs/remotes/origin/" + branch in defaults:
+        raise CheckError("locally known default branch cannot be removed")
+    for metadata in {git_dir, common}:
+        markers = {"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
+                   "rebase-merge", "rebase-apply", "BISECT_START", "sequencer", "index.lock"}
+        if markers.intersection(os.listdir(metadata)):
+            raise CheckError("worktree has an active Git operation")
     tip = _git(["rev-parse", "--verify", "HEAD^{commit}"], path).strip()
     if record.get("HEAD") != tip:
         raise CheckError("worktree HEAD changed during inspection")
     _require_visible_index(path)
-    if _git(["status", "--porcelain=v1", "--untracked-files=all"], path).strip():
-        raise CheckError("worktree has staged, unstaged, or untracked changes")
     return {"path": path, "repo_root": root, "common_dir": common,
             "git_dir": git_dir, "branch": branch, "tip": tip}
 
@@ -216,46 +206,42 @@ def _check_branch_policy(candidate, root):
         candidate["pr"] = closed[0]
         candidate["remote_tip"] = remote_tip
         candidate["recoverability"] = "local tip is contained in the current remote branch"
-    candidate.update({"eligible": True, "reason": "closed or merged PR; clean and recoverable"})
 
 
-def evaluate(checkout: str, repo_root: str) -> dict:
-    """Inspect one target only. Any uncertainty keeps it; no refs are fetched."""
-    candidate = {"eligible": False, "reason": "eligibility checks incomplete"}
+def evaluate(checkout: str, repo_root: str, patterns_path=None) -> dict:
+    """Inspect one checkout locally; network availability never gates disk cleanup."""
+    candidate = {"eligible": False, "reason": "eligibility checks incomplete",
+                 "cleanup_kind": "keep", "remove_worktree": False, "blockers": [],
+                 "disposable_files": 0, "disposable_bytes": 0,
+                 "patterns_path": os.path.abspath(patterns_path) if patterns_path else None}
     try:
         candidate.update(_inspect(checkout, repo_root))
-        _check_branch_policy(candidate, candidate["repo_root"])
-    except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
+        scan = disposable.inspect(candidate["path"], candidate["patterns_path"], _git)
+        removable = not scan["blockers"]
+        eligible = removable or bool(scan["allowed"])
+        reason = ("clean checkout; all extra files are disposable" if removable else
+                  "disposable ignored files can be removed; " + "; ".join(scan["blockers"])
+                  if eligible else "; ".join(scan["blockers"]))
+        candidate.update(eligible=eligible, reason=reason, remove_worktree=removable,
+                         cleanup_kind="remove" if removable else "partial" if eligible else "keep",
+                         blockers=scan["blockers"], disposable_files=scan["disposable_files"],
+                         disposable_bytes=scan["disposable_bytes"],
+                         policy_signature=scan["policy_signature"], snapshot=scan["snapshot"])
+    except (CheckError, disposable.DisposalError, OSError, ValueError, KeyError, TypeError) as exc:
         candidate["reason"] = str(exc) or "eligibility check failed"
+        candidate["blockers"] = [candidate["reason"]]
     return candidate
 
 
-_IDENTITY = ("path", "repo_root", "common_dir", "git_dir", "branch", "tip", "origin", "github_repo")
-
-
-def _final_unchanged(candidate):
-    path = candidate["path"]
-    if _real(path) != path or _common(path) != candidate["common_dir"]:
-        return False
-    if _nested_repository(path):
-        raise CheckError("target contains a nested Git repository")
-    git_dir = _real(os.path.join(path, _git(["rev-parse", "--git-dir"], path).strip()))
-    if git_dir != candidate["git_dir"]:
-        return False
-    branch = _git(["symbolic-ref", "--quiet", "--short", "HEAD"], path).strip()
-    tip = _git(["rev-parse", "--verify", "HEAD^{commit}"], path).strip()
-    if branch != candidate["branch"] or tip != candidate["tip"]:
-        return False
-    _require_visible_index(path)
-    return not _git(["status", "--porcelain=v1", "--untracked-files=all"], path).strip()
+_IDENTITY = ("path", "repo_root", "common_dir", "git_dir", "branch", "tip")
 
 
 def _remove_branch(candidate):
     root, branch, tip = candidate["common_dir"], candidate["branch"], candidate["tip"]
     policy = dict(candidate)
     _check_branch_policy(policy, root)
-    if any(policy.get(key) != candidate.get(key) for key in ("origin", "github_repo")):
-        raise CheckError("origin changed during worktree removal")
+    if _git(["remote", "get-url", "origin"], root).strip() != policy["origin"]:
+        raise CheckError("origin changed during branch checks")
     ref = "refs/heads/" + branch
     if _git(["rev-parse", "--verify", ref], root).strip() != tip:
         raise CheckError("local branch tip changed during worktree removal")
@@ -294,32 +280,63 @@ def _remove_branch(candidate):
 
 
 def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
-    """Recheck eligibility before removing the checkout and its unchanged local branch."""
-    result = dict(candidate, outcome="kept", worktree_removed=False, branch_removed=False)
+    """Recheck the checkout, reclaim disposable files, then best-effort branch cleanup."""
+    result = dict(candidate, outcome="kept", worktree_removed=False, branch_removed=False,
+                  branch_reason="checkout retained", disposed_files=0, disposed_bytes=0)
     if not candidate.get("eligible"):
         return dict(result, reason="initial candidate is not eligible")
     try:
-        current = evaluate(candidate["path"], candidate["repo_root"])
+        current = evaluate(candidate["path"], candidate["repo_root"], candidate.get("patterns_path"))
         if not current.get("eligible"):
-            return dict(result, reason=current["reason"])
+            return dict(result, reason=current["reason"], blockers=current.get("blockers", []))
         if any(candidate.get(key) != current.get(key) for key in _IDENTITY):
-            return dict(result, reason="worktree identity, branch, HEAD, or origin changed")
-        final = _inspect(candidate["path"], candidate["repo_root"])
-        if any(final.get(key) != candidate.get(key) for key in _IDENTITY[:6]):
             return dict(result, reason="worktree identity, branch, or HEAD changed")
-        try:
-            unused = still_unused()
-        except Exception as exc:
-            raise CheckError("worktree usage check failed: " + type(exc).__name__) from exc
-        if unused is not True:
-            return dict(result, reason="worktree is still in use or usage could not be established")
-        # Usage checks can perform socket I/O. Recheck local state after that
-        # wait, immediately before Git's own non-forced cleanliness guard.
-        if not _final_unchanged(candidate):
-            return dict(result, reason="worktree identity, branch, HEAD, or status changed during usage check")
-        result = dict(current, outcome="failed", worktree_removed=False, branch_removed=False)
-        # Removal can take arbitrarily long for ignored dependency directories.
-        # Killing it on a check deadline can leave a partially deleted checkout.
+        if candidate.get("policy_signature") != current.get("policy_signature"):
+            return dict(result, reason="disposable pattern file changed")
+        if candidate.get("snapshot") != current.get("snapshot"):
+            return dict(result, reason="worktree files or status changed after inspection")
+
+        def guard(remaining=None):
+            try:
+                unused = still_unused()
+            except Exception as exc:
+                raise CheckError("worktree usage check failed: " + (str(exc) or type(exc).__name__)[:500]) from exc
+            if unused is not True:
+                raise CheckError("worktree is still in use or usage could not be established")
+            final = _inspect(candidate["path"], candidate["repo_root"])
+            if any(final.get(key) != candidate.get(key) for key in _IDENTITY):
+                raise CheckError("worktree identity, branch, or HEAD changed during usage check")
+            if disposable.policy(candidate.get("patterns_path"))[0] != candidate["policy_signature"]:
+                raise CheckError("disposable pattern file changed during usage check")
+            if remaining:
+                tracked = set(_git(["ls-files", "-z"], candidate["path"]).split("\0"))
+                ignored = set(_git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                                   candidate["path"]).split("\0"))
+                if not remaining.issubset(ignored - tracked):
+                    raise CheckError("planned disposable files became tracked, non-ignored, or absent")
+
+        guard()
+        scan = disposable.inspect(candidate["path"], candidate.get("patterns_path"), _git)
+        if scan["snapshot"] != candidate["snapshot"]:
+            return dict(result, reason="worktree files or status changed during usage check")
+        result = dict(current, outcome="kept", worktree_removed=False, branch_removed=False,
+                      branch_reason="checkout retained", disposed_files=0, disposed_bytes=0)
+        result.update(disposable.discard(candidate["path"], scan, guard))
+        if result["disposed_files"]:
+            result["outcome"] = "partial"
+        # Reinspect ignored files as well as ordinary Git dirt: Git itself would
+        # silently delete ignored files, even when worktree remove is not forced.
+        guard()
+        final = evaluate(candidate["path"], candidate["repo_root"], candidate.get("patterns_path"))
+        if any(final.get(key) != candidate.get(key) for key in _IDENTITY):
+            raise CheckError("worktree identity, branch, or HEAD changed before removal")
+        if final.get("policy_signature") != candidate.get("policy_signature"):
+            raise CheckError("disposable pattern file changed before removal")
+        if not final.get("remove_worktree") or final.get("disposable_files"):
+            return dict(result, reason="removed disposable ignored files; checkout retained" if
+                        result["disposed_files"] else final["reason"],
+                        blockers=final.get("blockers", []))
+        result["outcome"] = "failed"
         _git(["worktree", "remove", "--", candidate["path"]], candidate["repo_root"], timeout=None)
         if os.path.lexists(candidate["path"]):
             raise CheckError("git worktree remove left the checkout on disk")
@@ -328,14 +345,21 @@ def remove_candidate(candidate: dict, still_unused: Callable[[], bool]) -> dict:
             raise CheckError("git worktree remove left the worktree registration")
         if os.path.lexists(candidate["git_dir"]):
             raise CheckError("git worktree remove left the worktree Git metadata")
-        result["worktree_removed"] = True
-        _remove_branch(candidate)
-        return dict(result, outcome="removed", branch_removed=True,
-                    reason="removed clean worktree and local branch")
-    except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
+        result.update(worktree_removed=True, outcome="removed", blockers=[],
+                      reason="removed checkout; retained local branch")
+        try:
+            _remove_branch(candidate)
+            result.update(branch_removed=True, branch_reason="closed or merged PR; tip recoverable on GitHub",
+                          reason="removed checkout and local branch")
+        except (CheckError, OSError, ValueError, KeyError, TypeError) as exc:
+            result["branch_reason"] = str(exc) or "branch deletion check failed"
+        return result
+    except (CheckError, disposable.DisposalError, OSError, ValueError, KeyError, TypeError) as exc:
+        if hasattr(exc, "disposed"):
+            result.update(exc.disposed)
         reason = str(exc) or "removal check failed"
-        if result["worktree_removed"]:
-            reason += "; worktree removed; local branch cleanup incomplete"
-        elif result["outcome"] == "failed":
+        if result["disposed_files"] and result["outcome"] == "kept":
+            result["outcome"] = "partial"
+        if result["outcome"] == "failed":
             reason += "; removal may be incomplete"
         return dict(result, reason=reason)
