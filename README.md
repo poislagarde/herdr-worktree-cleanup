@@ -92,51 +92,81 @@ herdr plugin action invoke poislagarde.worktree-cleanup.check
 
 ## Register worktrees created by agents
 
-A space can own several worktrees, including worktrees from different repositories.
-After creating or starting to use one, run this synchronously from the creating
-herdr pane (replace `<plugin-root>` with this installed plugin's directory):
+Worktrees created or opened through herdr are already observed. For automatic
+registration of worktrees created with ordinary `git worktree add`, enroll each
+repository once using the companion [shell-setup](https://github.com/poislagarde/shell-setup)
+helper. First complete its bootstrap, including the
+`~/.shell-setup/worktree-register.py` link and agent hooks, and enable this plugin.
+
+Run once for each repository's primary checkout:
 
 ```sh
-python3 <plugin-root>/plugin.py register --checkout /absolute/worktree/path --defer-on-unavailable
+python3 ~/.shell-setup/worktree-register.py install /path/to/main-checkout
 ```
 
-Registration records the exact linked checkout, primary repository and filesystem
-identity. Dirty, detached and locked worktrees may be registered; the existing
-cleanup rules still decide whether any files can be removed. Repeated registrations
-are idempotent. Multiple spaces may register the same checkout, and every owner
-must be closed before cleanup can proceed, even when an agent's pane directory
-is elsewhere and its commands use `git -C`.
-
-Attribution requires inherited `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. The plugin
-resolves that pane's current workspace and terminal through herdr. It never
-substitutes the focused space or trusts an inherited workspace ID after a pane
-move. Register at creation/use time: space-close snapshots do not contain a
-history of worktrees used by commands.
-
-If a sandbox prevents the live pane lookup, `--defer-on-unavailable` stores a
-pending request with the original pane/socket and exact checkout identity. A
-host-side agent hook can validate queued requests after a tool finishes:
+Then create worktrees from the herdr pane that should own them, or from an agent
+running in that pane:
 
 ```sh
-python3 <plugin-root>/plugin.py drain
+git -C /path/to/main-checkout worktree add -b my-task /path/to/my-task
 ```
 
-`drain` needs no current pane environment and never cleans files. It processes
-at most four due requests per invocation. Unavailable requests retry after
-30 seconds with exponential backoff, capped at one hour. A request whose checkout
-is positively missing or replaced is rejected; other uncertainty keeps it pending.
-A matching pending request blocks cleanup until ownership can be verified.
-Neither command starts a watcher or performs a cleanup sweep.
+The new checkout is registered automatically. Repeat enrollment for other
+repositories; one space can own worktrees from several repositories.
 
-State lives in `$XDG_STATE_HOME/herdr/plugins/poislagarde.worktree-cleanup`
-(default `~/.local/state/herdr/plugins/poislagarde.worktree-cleanup`), in
-`worktrees.json`. Config lives under `$XDG_CONFIG_HOME/herdr/plugins/config/poislagarde.worktree-cleanup`
-(default `~/.config/herdr/plugins/config/poislagarde.worktree-cleanup`). Explicit
-`HERDR_PLUGIN_STATE_DIR` / `HERDR_PLUGIN_CONFIG_DIR` overrides take precedence.
-Adapters invoked from another plugin must pass this plugin's directories.
-The v2 registry retains existing v1 observations; read-only previews do not rewrite
-old registry files. Registration and cleanup share per-repository locks so a
-newly accepted owner cannot race removal.
+For an existing worktree or one created with `git worktree add --no-checkout`,
+register it explicitly from its owning herdr pane:
+
+```sh
+python3 ~/.shell-setup/worktree-register.py register /path/to/linked-checkout
+```
+
+If another space also uses that checkout, run the registration command from that
+space too. Closing a space checks its registered worktrees for cleanup; checkouts
+still owned by another open space are retained. The [cleanup rules](#cleanup-rules)
+apply to every registered worktree.
+
+If installation refuses an existing hook manager or a relative `core.hooksPath`,
+add the following command through that manager's `post-checkout` configuration,
+passing Git's three hook arguments and preserving the existing hook's exit status:
+
+```sh
+python3 ~/.shell-setup/worktree-register.py post-checkout "$@"
+```
+
+Sandboxed registrations may remain pending until the agent's host-side
+`PostToolUse` hook runs. Review and trust the Codex hook through `/hooks` when
+prompted. To retry pending registrations manually from a shell with herdr access:
+
+```sh
+python3 ~/.shell-setup/worktree-register.py drain
+```
+
+Registration and draining do not remove files. If registration reports missing
+pane context or permissions, fix the reported issue and rerun `register` from
+the owning herdr pane. Preview cleanup with the [explicit sweep commands](#events-and-explicit-sweeps).
+
+### Without shell-setup
+
+Find the installed plugin's `plugin_root`:
+
+```sh
+herdr plugin list --plugin poislagarde.worktree-cleanup --json
+```
+
+Use that directory in place of `/path/to/plugin` below. Run registration from
+the owning herdr pane for each worktree:
+
+```sh
+python3 /path/to/plugin/plugin.py register --checkout /path/to/linked-checkout --defer-on-unavailable
+```
+
+Retry pending registrations from a shell with herdr access, or add this command
+to a host-side agent hook that runs after tool use:
+
+```sh
+python3 /path/to/plugin/plugin.py drain
+```
 
 ## Configuration and reporting
 
