@@ -5,6 +5,7 @@ import copy
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -71,6 +72,9 @@ class PluginTests(unittest.TestCase):
         self.remove_patch = mock.patch.object(plugin, "remove_candidate", side_effect=self.remove)
         self.remove_candidate = self.remove_patch.start()
         self.addCleanup(self.remove_patch.stop)
+        branch = mock.patch.object(plugin, "current_branch", return_value="feature")
+        branch.start()
+        self.addCleanup(branch.stop)
 
     def set_event(self, name="workspace.closed"):
         os.environ["HERDR_PLUGIN_EVENT"] = name
@@ -111,6 +115,10 @@ class PluginTests(unittest.TestCase):
         elif command == ("pane", "list"):
             value = {"result": {"panes": self.panes[socket]}}
         elif command[:2] == ("notification", "show"):
+            value = {"result": {}}
+        elif command[:2] == ("pane", "split"):
+            value = {"result": {"pane": {"pane_id": "revived"}}}
+        elif command[:2] in {("pane", "run"), ("pane", "close")}:
             value = {"result": {}}
         else:
             self.fail("unexpected Herdr command: " + repr(command))
@@ -494,6 +502,13 @@ class PluginTests(unittest.TestCase):
         self.evaluate.assert_not_called()
         self.remove_candidate.assert_not_called()
 
+    def test_observe_skips_deleted_checkout_and_records_the_rest(self):
+        deleted = dict(self.provenance, checkout_path=str(self.root / "deleted"))
+        self.workspaces[self.socket] = [{"workspace_id": "dead", "worktree": deleted},
+                                        {"workspace_id": "live", "worktree": self.provenance}]
+        self.assertEqual(plugin.run("observe")["recorded"], 1)
+        self.assertEqual(plugin.registry(), [plugin.observed_record(self.checkout, self.repo)])
+
     def test_observe_ignores_ordinary_pane_paths_without_worktree_provenance(self):
         self.workspaces[self.socket] = [{"workspace_id": "ordinary"}]
         self.panes[self.socket] = [{"cwd": self.checkout}]
@@ -630,6 +645,69 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(result["notification_delivered"])
         notices = [command for _, command in self.calls if command[:2] == ("notification", "show")]
         self.assertEqual(len(notices), 1)
+
+    def dead_pane(self, **extra):
+        pane = {"pane_id": "dead", "cwd": self.checkout, "restore_error": "Saved directory is unavailable.",
+                "agent_session": {"agent": "claude", "kind": "id", "value": "session-1"}}
+        self.panes[self.socket] = [dict(pane, **extra)]
+
+    def recreate(self, args, cwd):
+        Path(self.checkout).mkdir()
+        (Path(self.checkout) / ".git").write_text("gitdir: " + self.common_dir + "/worktrees/feature\n")
+        return ""
+
+    def test_observe_records_checkout_branch(self):
+        self.observe_checkout()
+        with plugin.registry_state() as data:
+            self.assertEqual(data["branches"], {self.checkout: "feature"})
+
+    def test_restore_recreates_deleted_checkout_and_resumes_agent(self):
+        self.observe_checkout()
+        shutil.rmtree(self.checkout)
+        self.dead_pane()
+        with mock.patch.object(plugin, "_git", side_effect=self.recreate) as git:
+            result = plugin.run("restore")
+        git.assert_called_once_with(["worktree", "add", "--", self.checkout, "feature"], self.repo)
+        self.assertEqual(result["results"][0]["outcome"], "revived")
+        commands = [command for _, command in self.calls]
+        split = commands.index(("pane", "split", "dead", "--direction", "right", "--cwd", self.checkout, "--no-focus"))
+        run = commands.index(("pane", "run", "revived", "claude --resume session-1"))
+        close = commands.index(("pane", "close", "dead"))
+        self.assertLess(split, run)
+        self.assertLess(run, close)
+        self.assertTrue(result["notification_delivered"])
+        self.remove_candidate.assert_not_called()
+
+    def test_restore_keeps_dead_pane_without_recorded_branch(self):
+        with mock.patch.object(plugin, "current_branch", return_value=None):
+            self.observe_checkout()
+        shutil.rmtree(self.checkout)
+        self.dead_pane()
+        with mock.patch.object(plugin, "_git") as git:
+            result = plugin.run("restore")
+        git.assert_not_called()
+        self.assertEqual(result["results"][0]["outcome"], "kept")
+        self.assertFalse(any(command[:2] in {("pane", "split"), ("pane", "close")} for _, command in self.calls))
+
+    def test_restore_ignores_unrecorded_directories_and_live_panes(self):
+        self.dead_pane(cwd=str(self.root / "elsewhere"))
+        self.panes[self.socket].append({"pane_id": "live", "cwd": self.checkout})
+        with mock.patch.object(plugin, "_git") as git:
+            result = plugin.run("restore")
+        git.assert_not_called()
+        self.assertEqual([item["outcome"] for item in result["results"]], ["kept"])
+
+    def test_restore_without_dead_panes_only_observes(self):
+        self.panes[self.socket] = [{"pane_id": "live", "cwd": self.checkout}]
+        result = plugin.run("restore")
+        self.assertEqual((result["outcome"], result["results"]), ("restored", []))
+        self.assertFalse(any(command[:2] == ("notification", "show") for _, command in self.calls))
+
+    def test_forgetting_a_worktree_drops_its_branch(self):
+        self.observe_checkout()
+        plugin.registry(forget=plugin.observed_record(self.checkout, self.repo))
+        with plugin.registry_state() as data:
+            self.assertEqual(data["branches"], {})
 
     def test_public_logs_omit_internal_snapshots_and_limit_file_names(self):
         result = plugin.public_result({"_scan": {"file": "content"}, "outcome": "kept",

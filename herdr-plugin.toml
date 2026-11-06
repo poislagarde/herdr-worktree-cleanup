@@ -1,12 +1,12 @@
 id = "poislagarde.worktree-cleanup"
 name = "Worktree Cleanup"
-version = "0.4.0"
+version = "0.5.0"
 min_herdr_version = "0.9.0"
-description = "Clean disposable files and unused worktree checkouts while preserving local work."
+description = "Clean disposable files and unused worktree checkouts while preserving local work, and revive panes whose checkout was deleted."
 platforms = ["linux", "macos"]
 
 [[startup]]
-command = ["python3", "plugin.py", "observe"]
+command = ["python3", "plugin.py", "restore"]
 
 [[actions]]
 id = "check"
@@ -25,6 +25,12 @@ id = "clean-unused"
 title = "Clean known unused worktrees"
 contexts = ["global", "workspace"]
 command = ["python3", "plugin.py", "clean-unused"]
+
+[[actions]]
+id = "restore"
+title = "Recreate deleted worktrees under restored panes"
+contexts = ["global", "workspace"]
+command = ["python3", "plugin.py", "restore"]
 
 [[actions]]
 id = "observe"

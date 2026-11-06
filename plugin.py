@@ -8,17 +8,20 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 
-from git_cleanup import CheckError, _common, evaluate, remove_candidate
+from git_cleanup import CheckError, _common, _git, evaluate, remove_candidate
 from registration import inspect_checkout
 
 
 PLUGIN_ID = "poislagarde.worktree-cleanup"
+# Agents whose saved session a revived pane resumes; others reopen as a shell.
+RESUME = {"claude": ["claude", "--resume"], "codex": ["codex", "resume"]}
 
 
 def plugin_directory(kind):
@@ -121,7 +124,9 @@ class Herdr:
                     raise Keep("invalid Herdr worktree metadata")
                 if provenance.get("is_linked_worktree") is True:
                     checkout, repo = provenance_paths(provenance)
-                    records.append(observed_record(checkout, repo))
+                    # A deleted checkout has nothing to record; it must not block the others.
+                    if os.path.lexists(checkout):
+                        records.append(observed_record(checkout, repo))
         return records
 
     def unused(self, checkout, closed_workspace_id=None):
@@ -314,6 +319,10 @@ def registry_state(write=False):
             if absolute_path(request["socket"]) != request["socket"]:
                 raise Keep("invalid pending socket")
             identifier(request["pane_id"])
+        branches = data.setdefault("branches", {})
+        if not isinstance(branches, dict) or not all(
+                isinstance(branch, str) and branch and checkout in records for checkout, branch in branches.items()):
+            raise Keep("invalid recorded worktree branches")
         yield data
         if write:
             data["worktrees"].sort(key=lambda record: record["checkout"])
@@ -335,6 +344,12 @@ def merge_record(data, record):
     if previous is not None and previous["identity"] != record["identity"]:
         data["owners"] = [owner for owner in data["owners"] if owner["checkout"] != record["checkout"]]
     data["worktrees"] = [item for item in data["worktrees"] if item["checkout"] != record["checkout"]] + [record]
+    # Kept so a checkout deleted under a pane can be recreated on restore.
+    # ponytail: refreshed only when the checkout is observed or registered; a later
+    # branch switch inside it is missed until then.
+    branch = current_branch(record["checkout"])
+    if branch:
+        data["branches"][record["checkout"]] = branch
 
 
 def registry(update=None, forget=None):
@@ -344,7 +359,64 @@ def registry(update=None, forget=None):
         if forget and forget in data["worktrees"]:
             data["worktrees"].remove(forget)
             data["owners"] = [owner for owner in data["owners"] if owner["checkout"] != forget["checkout"]]
+            data["branches"].pop(forget["checkout"], None)
         return sorted(data["worktrees"], key=lambda record: record["checkout"])
+
+
+def current_branch(checkout):
+    try:
+        return _git(["symbolic-ref", "--quiet", "--short", "HEAD"], checkout).strip() or None
+    except CheckError:
+        return None  # detached or unreadable: nothing to recreate the checkout from
+
+
+def revive(herdr):
+    """Recreate checkouts deleted under restored panes, then reopen each pane's agent in place."""
+    panes = herdr.call("pane", "list").get("panes")
+    if not isinstance(panes, list):
+        raise Keep("invalid Herdr pane list")
+    dead = [pane for pane in panes if isinstance(pane, dict) and pane.get("restore_error")]
+    if not dead:
+        return []
+    with registry_state() as data:
+        records = list(data["worktrees"])
+        branches = dict(data["branches"])
+    # The recreated checkout's creation hook must not attribute it to the invoking pane.
+    os.environ.pop("HERDR_PANE_ID", None)
+    results = []
+    for pane in dead:
+        try:
+            results.append(revive_pane(herdr, pane, records, branches))
+        except (Keep, CheckError, OSError, ValueError) as error:
+            results.append({"outcome": "kept", "path": pane.get("cwd"), "reason": str(error)})
+    return results
+
+
+def revive_pane(herdr, pane, records, branches):
+    pane_id, cwd = identifier(pane.get("pane_id")), absolute_path(pane.get("cwd"))
+    reason = "directory present"
+    if not os.path.isdir(cwd):
+        owners = [record for record in records if inside(cwd, record["checkout"])]
+        if not owners:
+            raise Keep("saved directory is not a recorded worktree")
+        record = max(owners, key=lambda item: len(item["checkout"]))
+        branch = branches.get(record["checkout"])
+        if os.path.lexists(record["checkout"]) or not branch:
+            raise Keep("no recorded branch to recreate the worktree from")
+        # Git refuses a branch checked out elsewhere and an occupied path.
+        _git(["worktree", "add", "--", record["checkout"], branch], record["repo"])
+        reason = "worktree recreated from branch " + branch
+        if not os.path.isdir(cwd):
+            cwd = record["checkout"]
+    created = herdr.call("pane", "split", pane_id, "--direction", "right", "--cwd", cwd, "--no-focus")
+    new_id = identifier((created.get("pane") or {}).get("pane_id"))
+    session = pane.get("agent_session") or {}
+    command = RESUME.get(session.get("agent")) if session.get("kind") == "id" else None
+    if command:
+        herdr.call("pane", "run", new_id, shlex.join(command + [identifier(session.get("value"))]), raw=True)
+        reason += "; resumed " + session["agent"]
+    herdr.call("pane", "close", pane_id, raw=True)
+    return {"outcome": "revived", "path": cwd, "pane_id": new_id, "reason": reason}
 
 
 def ownership(checkout=None):
@@ -599,6 +671,15 @@ def cleanup(herdr, record, *, dry_run=False, workspace_id=None, active_check=Fal
 
 
 def run(action):
+    if action == "restore":
+        herdr = Herdr()
+        results = revive(herdr)
+        # Revival runs before observation: recreated checkouts get recorded with their new identity.
+        response = dict(run("observe"), outcome="restored", results=results)
+        if results:
+            body = "\n\n".join(describe(result) for result in results[:4])
+            response["notification_delivered"] = herdr.notify("Panes restored after deleted worktrees", body)
+        return response
     if action in {"observe", "clean-unused", "check-unused"}:
         herdr = Herdr()
         observations = herdr.observed()
@@ -676,7 +757,7 @@ def public_result(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["event", "check", "observe", "clean-unused", "check-unused", "register", "drain"])
+    parser.add_argument("action", choices=["event", "check", "observe", "restore", "clean-unused", "check-unused", "register", "drain"])
     parser.add_argument("--checkout")
     parser.add_argument("--defer-on-unavailable", action="store_true")
     args = parser.parse_args()
