@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise cleanup hooks on disposable headless Herdr sessions and Git fixtures.
 
-Run with Python 3.9+ and an installed herdr. No live Herdr session or GitHub
+Run with Python 3.11+ and an installed herdr. No live Herdr session or GitHub
 account is accessed: config, state, sockets, repositories and gh are private.
 """
 
@@ -350,6 +350,28 @@ def registration_smoke(root, plugin_dir, first, second, fixtures):
     print("PASS: moving a registered pane transfers ownership and cleanup waits for its destination space to close")
 
 
+def restore_smoke(root, herdr, env, fixtures, servers):
+    server = Server(root, "smoke-restore", herdr, env)
+    servers.append(server)
+    server.ready()
+    path = fixtures.worktree("deleted-under-pane", state="OPEN")
+    previous = {log["log_id"] for log in server.logs()}
+    server.open_worktree(fixtures.repo, path)
+    server.settled(previous, "worktree.opened")
+    server.stop()
+    fixtures.run("worktree", "remove", "--force", str(path))
+    restarted = Server(root, "smoke-restore", herdr, env)
+    servers.append(restarted)
+    restarted.ready()
+
+    def revived():
+        panes = [pane for pane in restarted.run("pane", "list")["panes"] if pane.get("cwd") == str(path)]
+        return bool(panes) and not any(pane.get("restore_error") for pane in panes) and path.is_dir()
+    wait_for("startup revival of a pane whose checkout was deleted", revived)
+    assert fixtures.run("rev-parse", "--abbrev-ref", "HEAD", cwd=path) == "deleted-under-pane"
+    print("PASS: restart recreates a checkout deleted under a pane from its branch and replaces the dead pane")
+
+
 def smoke(root, herdr, plugin_dir, servers):
     git = shutil.which("git")
     if not git:
@@ -476,6 +498,7 @@ def smoke(root, herdr, plugin_dir, servers):
     assert path.is_dir(), "Removed checkout used by another Herdr session"
     print("PASS: another local Herdr session protects the checkout")
     registration_smoke(root, plugin_dir, first, second, fixtures)
+    restore_smoke(root, herdr, env, fixtures, servers)
 
 
 def main():

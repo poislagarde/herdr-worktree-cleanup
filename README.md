@@ -1,10 +1,10 @@
 # herdr worktree cleanup
 
-Reclaim disposable files when a herdr space closes, and remove its checkout when no local files need preserving. Keep the local branch unless a closed or merged GitHub PR verifies that its current commits are recoverable. Remote branches are unchanged.
+Reclaim disposable files when a herdr space closes, and remove its checkout when no local files need preserving. Keep the local branch unless a closed or merged GitHub PR verifies that its current commits are recoverable. Remote branches are unchanged. When herdr restarts with a pane whose recorded checkout was deleted, recreate the checkout from its branch and reopen the pane.
 
 ## Install
 
-Requires [herdr](https://herdr.dev/) 0.9.0 or newer, Python 3.9 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
+Requires [herdr](https://herdr.dev/) 0.9.0 or newer, Python 3.11 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
 
 Run from a local herdr pane:
 
@@ -88,6 +88,20 @@ The `check-unused` action does not modify checkouts, branches, or the provenance
 
 ```sh
 herdr plugin action invoke poislagarde.worktree-cleanup.check
+```
+
+## Restore panes after a deleted checkout
+
+herdr cannot restore a pane whose saved directory no longer exists; it keeps the pane with "Saved directory is unavailable". On startup, the plugin handles each such pane inside a recorded worktree:
+
+1. Recreate the checkout at its old path with `git worktree add`, from the branch recorded when the worktree was last observed or registered.
+2. Open a replacement pane beside it and resume the pane's Claude Code or Codex session; other agents reopen as a shell.
+3. Close the dead pane, then send one notification.
+
+Git refuses a branch that is checked out elsewhere and an occupied path, so revival never overwrites work. A pane whose directory is not a recorded worktree, or whose branch was never recorded or no longer exists, stays as herdr left it, and the notification gives the reason. Files that were not committed to the branch are not recovered. To retry after fixing the reported problem:
+
+```sh
+herdr plugin action invoke poislagarde.worktree-cleanup.restore
 ```
 
 ## Register worktrees created by agents
@@ -211,7 +225,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tests/herdr_smoke.py
 ```
 
-The smoke test requires an installed herdr and uses private headless servers, sockets, repositories, and fake GitHub responses. CI runs unit tests on Python 3.9 and the latest stable Python. Include tests for changes to deletion policy or event handling.
+The smoke test requires an installed herdr and uses private headless servers, sockets, repositories, and fake GitHub responses. CI runs unit tests on Python 3.11 and the latest stable Python. Include tests for changes to deletion policy or event handling.
 
 ## License
 

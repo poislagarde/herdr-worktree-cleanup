@@ -1,4 +1,4 @@
-"""Conservative, explicitly targeted GitHub worktree cleanup (Python 3.9+)."""
+"""Conservative, explicitly targeted GitHub worktree cleanup (Python 3.11+)."""
 
 import json
 import os
