@@ -9,12 +9,11 @@ permissions:
 
 jobs:
   unit:
-    # Newest image with Python 3.9 builds; macOS still ships 3.9 as /usr/bin/python3.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.x']
+        python-version: ['3.11', '3.x']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

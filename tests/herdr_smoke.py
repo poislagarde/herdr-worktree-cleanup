@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise cleanup hooks on disposable headless Herdr sessions and Git fixtures.
 
-Run with Python 3.9+ and an installed herdr. No live Herdr session or GitHub
+Run with Python 3.11+ and an installed herdr. No live Herdr session or GitHub
 account is accessed: config, state, sockets, repositories and gh are private.
 """
 

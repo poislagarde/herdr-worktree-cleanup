@@ -4,7 +4,7 @@ Reclaim disposable files when a herdr space closes, and remove its checkout when
 
 ## Install
 
-Requires [herdr](https://herdr.dev/) 0.9.0 or newer, Python 3.9 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
+Requires [herdr](https://herdr.dev/) 0.9.0 or newer, Python 3.11 or newer, and Git. Branch deletion also requires an authenticated [GitHub CLI](https://cli.github.com/). The plugin performs occasional event-driven Git and herdr orchestration; Python keeps the structured checks and cleanup straightforward. It uses the standard library and needs no build step.
 
 Run from a local herdr pane:
 
@@ -225,7 +225,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tests/herdr_smoke.py
 ```
 
-The smoke test requires an installed herdr and uses private headless servers, sockets, repositories, and fake GitHub responses. CI runs unit tests on Python 3.9 and the latest stable Python. Include tests for changes to deletion policy or event handling.
+The smoke test requires an installed herdr and uses private headless servers, sockets, repositories, and fake GitHub responses. CI runs unit tests on Python 3.11 and the latest stable Python. Include tests for changes to deletion policy or event handling.
 
 ## License
 
